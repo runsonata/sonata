@@ -78,6 +78,9 @@ void registerBuiltinLibraries(LibraryRegistry& registry) {
     registry.add({"crypto", libs::openCrypto});
     registry.add({"datetime", libs::openDatetime});
     registry.add({"compress", libs::openCompress});
+    registry.add({"regex", libs::openRegex});
+    registry.add({"serde", libs::openSerde});
+    registry.add({"sonata", libs::openSonata});
 }
 
 } // namespace sonata::lib

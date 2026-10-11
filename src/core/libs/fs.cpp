@@ -7,7 +7,6 @@
 // Paths are UTF-8 strings. File contents are binary-safe Lua strings.
 //
 // Variables
-//     fs.version                             --> version (no shi)
 //     fs.maxReadSize                         --> largest file readFile() accepts, in bytes
 //     fs.maxChunkSize                        --> largest chunk a reader can produce, in bytes
 //     fs.modes                               --> permission presets for chmod():
@@ -1469,9 +1468,6 @@ constexpr NativeFunction kFunctions[] = {
 void openFs(lua_State* L) {
     lua_createtable(L, 0, static_cast<int>(std::size(kFunctions)) + 4);
     setFunctions(L, kFunctions);
-
-    lua_pushnumber(L, 1);
-    lua_setfield(L, -2, "version");
 
     lua_pushnumber(L, static_cast<double>(kMaxReadSize));
     lua_setfield(L, -2, "maxReadSize");

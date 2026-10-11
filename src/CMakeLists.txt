@@ -28,6 +28,9 @@ add_library(sonata
   core/libs/crypto.cpp
   core/libs/datetime.cpp
   core/libs/compress.cpp
+  core/libs/serde.cpp
+  core/libs/regex.cpp
+  core/libs/sonata.cpp
 )
 add_library(sonata::sonata ALIAS sonata)
 

@@ -3,7 +3,6 @@
 //
 //     local example = require("@sonata/example")
 //
-//     example.version                      --> 1
 //     example.repeatString("ab", 3, "-")   --> "ab-ab-ab"
 //     example.splitOnce("k=v=w", "=")      --> "k", "v=w"
 //     example.splitOnce("kv", "=")         --> "kv", nil
@@ -149,8 +148,6 @@ void openExample(lua_State* L) {
     lua_createtable(L, 0, static_cast<int>(std::size(kFunctions)) + 1);
     setFunctions(L, kFunctions);
 
-    lua_pushnumber(L, 1);
-    lua_setfield(L, -2, "version");
 }
 
 } // namespace sonata::lib::libs

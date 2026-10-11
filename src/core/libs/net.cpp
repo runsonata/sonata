@@ -2010,9 +2010,6 @@ void openNet(lua_State* L) {
     setFunctions(L, kUrlFunctions);
     lua_setreadonly(L, -1, 1);
     lua_setfield(L, -2, "url");
-
-    lua_pushnumber(L, 1);
-    lua_setfield(L, -2, "version");
 }
 
 } // namespace sonata::lib::libs

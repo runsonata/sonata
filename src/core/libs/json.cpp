@@ -11,7 +11,7 @@
 //     json.merge(target, patch)        -- RFC 7396 merge patch, in place; json.null deletes a key
 //     json.clone(v)                    -- deep copy
 //     json.array(t?), json.object(t?)  -- tag a table so it always encodes as [] / {}
-//     json.null, json.version
+//     json.null
 //
 
 #include <algorithm>
@@ -797,8 +797,6 @@ void openJson(lua_State* L) {
 
     pushNull(L);
     lua_setfield(L, -2, "null");
-    lua_pushnumber(L, 1);
-    lua_setfield(L, -2, "version");
 }
 
 } // namespace sonata::lib::libs

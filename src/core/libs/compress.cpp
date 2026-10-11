@@ -58,12 +58,10 @@ namespace {
 constexpr double kDefaultMaxSize = 256.0 * 1024 * 1024;
 constexpr double kHardMaxSize = 1024.0 * 1024 * 1024; // Luau strings cannot be larger anyway
 
-// ---------------------------------------------------------------------------
 // Engines: one incremental implementation per format serves both the one-shot
 // functions and the streaming ones. They report failure by RETURNING a message
 // (nullptr = success) instead of raising, so no C++ object is alive when a Lua
 // error is thrown.
-// ---------------------------------------------------------------------------
 
 class Engine {
 public:
@@ -315,12 +313,10 @@ const char* convert(const Codec& codec, bool encode, int level, std::size_t limi
     return engine->finish(out);
 }
 
-// ---------------------------------------------------------------------------
-// Password protection. Container, version 1:
+// Password protection. Container:
 //   "SCX\x01" | format name length (1 byte) | format name | salt (16) | nonce (24) | ciphertext + tag (16)
 // The key is Argon2id(password, salt). The cipher is XChaCha20-Poly1305 over the COMPRESSED bytes
 // (compress first, then encrypt), with the whole header as authenticated data.
-// ---------------------------------------------------------------------------
 
 constexpr std::string_view kMagic("SCX\x01", 4);
 constexpr std::size_t kSaltBytes = 16;
@@ -434,9 +430,7 @@ const char* encrypt(std::string_view, std::string_view, std::string_view, std::s
 const char* decrypt(const Container&, std::string_view, std::string&) { return kNoCrypto; }
 #endif
 
-// ---------------------------------------------------------------------------
-// Lua bindings
-// ---------------------------------------------------------------------------
+// Lua bindings ////////////////////////////////////////////////
 
 // Resolves the optional `format` argument at `idx`; `fallback` is used when it is absent.
 const Codec* argCodec(lua_State* L, int idx, const Codec* fallback) {
@@ -682,13 +676,9 @@ constexpr NativeFunction kFunctions[] = {
 
 } // namespace
 
-// The opener: runs once per VM and pushes exactly one value (the module table).
 void openCompress(lua_State* L) {
     lua_createtable(L, 0, static_cast<int>(std::size(kFunctions)) + 1);
     setFunctions(L, kFunctions);
-
-    lua_pushnumber(L, 2);
-    lua_setfield(L, -2, "version");
 }
 
 } // namespace sonata::lib::libs

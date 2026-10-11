@@ -18,4 +18,8 @@ void openJson(lua_State* L);     // @sonata/json
 void openCrypto(lua_State* L);   // @sonata/crypto
 void openDatetime(lua_State* L); // @sonata/datetime
 void openCompress(lua_State* L); // @sonata/compress
+void openRegex(lua_State* L);    // @sonata/regex
+void openSerde(lua_State* L);    // @sonata/serde
+void openSonata(lua_State* L);   // @sonata/sonata
+
 } // namespace sonata::lib::libs

@@ -1815,8 +1815,6 @@ void openCrypto(lua_State* L) {
     lua_createtable(L, 0, static_cast<int>(std::size(kFunctions)) + 4);
     setFunctions(L, kFunctions);
 
-    lua_pushnumber(L, 1);
-    lua_setfield(L, -2, "version");
     lua_pushboolean(L, aesHardware());
     lua_setfield(L, -2, "hardwareAes");
 
