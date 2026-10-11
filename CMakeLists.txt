@@ -11,6 +11,20 @@ option(SONATA_BUILD_CLI   "Build the sn executable" ${PROJECT_IS_TOP_LEVEL})
 option(SONATA_INSTALL     "Generate install rules"  ${PROJECT_IS_TOP_LEVEL})
 option(SONATA_BUILD_TESTS "Build unit tests"        ${PROJECT_IS_TOP_LEVEL})
 
+# Optional compress backends (zlib is always required).
+# The default comes from an environment variable of the same name, so CI can
+# enable them without changing b.sh. An explicit -D<NAME>=... always wins.
+function(sonata_env_option name doc)
+  set(default OFF)
+  if(DEFINED ENV{${name}} AND "$ENV{${name}}")
+    set(default ON)
+  endif()
+  option(${name} "${doc}" ${default})
+endfunction()
+
+sonata_env_option(SONATA_COMPRESS_ZSTD   "Enable zstd in the compress library (needs libzstd)")
+sonata_env_option(SONATA_COMPRESS_CRYPTO "Enable password support in the compress library (needs libsodium)")
+
 set(SONATA_BUILD_TYPE "")
 
 set(SONATA_OWNS_LUAU OFF)

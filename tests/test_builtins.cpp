@@ -440,4 +440,17 @@ TEST_SUITE("builtins") {
     )");
         REQUIRE(exec.getStatus() == 0);
     }
+
+    TEST_CASE("Builtin compress library is available through require") {
+        Exec exec(R"(
+        local compress = require("@sonata/compress")
+        assert(compress.version == 2)
+        local blob = compress.compress("hello hello hello hello")
+        assert(compress.detect(blob) == "gzip")
+        assert(compress.decompress(blob) == "hello hello hello hello")
+        assert(compress.decompress(compress.compress("abc", "zlib"), "zlib") == "abc")
+        assert(compress.crc32("abc") == 891568578)
+    )");
+    REQUIRE(exec.getStatus() == 0);
+}
 }

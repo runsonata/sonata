@@ -17,5 +17,5 @@ void openNet(lua_State* L);      // @sonata/net
 void openJson(lua_State* L);     // @sonata/json
 void openCrypto(lua_State* L);   // @sonata/crypto
 void openDatetime(lua_State* L); // @sonata/datetime
-
+void openCompress(lua_State* L); // @sonata/compress
 } // namespace sonata::lib::libs

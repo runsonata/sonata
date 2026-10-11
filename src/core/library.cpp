@@ -77,6 +77,7 @@ void registerBuiltinLibraries(LibraryRegistry& registry) {
     registry.add({"json", libs::openJson});
     registry.add({"crypto", libs::openCrypto});
     registry.add({"datetime", libs::openDatetime});
+    registry.add({"compress", libs::openCompress});
 }
 
 } // namespace sonata::lib

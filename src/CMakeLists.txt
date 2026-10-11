@@ -27,6 +27,7 @@ add_library(sonata
   core/libs/json.cpp
   core/libs/crypto.cpp
   core/libs/datetime.cpp
+  core/libs/compress.cpp
 )
 add_library(sonata::sonata ALIAS sonata)
 
@@ -40,6 +41,87 @@ target_include_directories(sonata
 
 find_package(OpenSSL REQUIRED)
 target_link_libraries(sonata PUBLIC Luau.Common Luau.VM Luau.Compiler Luau.Ast OpenSSL::SSL OpenSSL::Crypto)
+
+find_package(ZLIB REQUIRED)
+target_link_libraries(sonata PRIVATE ZLIB::ZLIB)
+
+if(SONATA_COMPRESS_ZSTD)
+  set(SONATA_ZSTD_TARGET "")
+
+  find_package(zstd CONFIG QUIET)
+  foreach(t zstd::libzstd zstd::libzstd_static zstd::libzstd_shared)
+    if(NOT SONATA_ZSTD_TARGET AND TARGET ${t})
+      set(SONATA_ZSTD_TARGET ${t})
+    endif()
+  endforeach()
+
+  if(NOT SONATA_ZSTD_TARGET)
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+      pkg_check_modules(SONATA_ZSTD_PC QUIET IMPORTED_TARGET libzstd)
+      if(SONATA_ZSTD_PC_FOUND)
+        set(SONATA_ZSTD_TARGET PkgConfig::SONATA_ZSTD_PC)
+      endif()
+    endif()
+  endif()
+
+  if(NOT SONATA_ZSTD_TARGET)
+    message(FATAL_ERROR
+      "SONATA_COMPRESS_ZSTD is ON but libzstd was not found. Install it "
+      "(libzstd-dev / brew install zstd / vcpkg install zstd), point "
+      "CMAKE_PREFIX_PATH at it, or configure with -DSONATA_COMPRESS_ZSTD=OFF.")
+  endif()
+
+  target_link_libraries(sonata PRIVATE ${SONATA_ZSTD_TARGET})
+  target_compile_definitions(sonata PUBLIC SONATA_COMPRESS_ZSTD)
+  message(STATUS "sonata: compress: zstd enabled (${SONATA_ZSTD_TARGET})")
+endif()
+
+if(SONATA_COMPRESS_CRYPTO)
+  set(SONATA_SODIUM_TARGET "")
+
+  find_package(unofficial-sodium CONFIG QUIET)
+  if(TARGET unofficial-sodium::sodium)
+    set(SONATA_SODIUM_TARGET unofficial-sodium::sodium)
+  endif()
+
+  if(NOT SONATA_SODIUM_TARGET)
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+      pkg_check_modules(SONATA_SODIUM_PC QUIET IMPORTED_TARGET libsodium)
+      if(SONATA_SODIUM_PC_FOUND)
+        set(SONATA_SODIUM_TARGET PkgConfig::SONATA_SODIUM_PC)
+      endif()
+    endif()
+  endif()
+
+  if(NOT SONATA_SODIUM_TARGET)
+    find_path(SONATA_SODIUM_INCLUDE_DIR sodium.h)
+    find_library(SONATA_SODIUM_LIBRARY NAMES sodium libsodium)
+    if(SONATA_SODIUM_INCLUDE_DIR AND SONATA_SODIUM_LIBRARY)
+      add_library(sonata_sodium UNKNOWN IMPORTED)
+      set_target_properties(sonata_sodium PROPERTIES
+        IMPORTED_LOCATION "${SONATA_SODIUM_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${SONATA_SODIUM_INCLUDE_DIR}")
+      if(WIN32 AND SONATA_SODIUM_LIBRARY MATCHES "\\.lib$" AND NOT SONATA_SODIUM_LIBRARY MATCHES "dll")
+        set_property(TARGET sonata_sodium APPEND PROPERTY
+          INTERFACE_COMPILE_DEFINITIONS SODIUM_STATIC)
+      endif()
+      set(SONATA_SODIUM_TARGET sonata_sodium)
+    endif()
+  endif()
+
+  if(NOT SONATA_SODIUM_TARGET)
+    message(FATAL_ERROR
+      "SONATA_COMPRESS_CRYPTO is ON but libsodium was not found. Install it "
+      "(libsodium-dev / brew install libsodium / vcpkg install libsodium), "
+      "point CMAKE_PREFIX_PATH at it, or configure with -DSONATA_COMPRESS_CRYPTO=OFF.")
+  endif()
+
+  target_link_libraries(sonata PRIVATE ${SONATA_SODIUM_TARGET})
+  target_compile_definitions(sonata PUBLIC SONATA_COMPRESS_CRYPTO)
+  message(STATUS "sonata: compress: password support enabled (${SONATA_SODIUM_TARGET})")
+endif()
 
 # ---- Build metadata for sonata/core/info.hpp ----
 # Version numbers come from project(... VERSION x.y.z) in the root CMakeLists.

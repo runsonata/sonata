@@ -7,8 +7,9 @@
 // Paths are UTF-8 strings. File contents are binary-safe Lua strings.
 //
 // Variables
-//     fs.version                             --> 1
+//     fs.version                             --> version (no shi)
 //     fs.maxReadSize                         --> largest file readFile() accepts, in bytes
+//     fs.maxChunkSize                        --> largest chunk a reader can produce, in bytes
 //     fs.modes                               --> permission presets for chmod():
 //         .file 420 (0644)      .executable 493 (0755)   .directory 493 (0755)
 //         .private 384 (0600)   .privateDirectory 448 (0700)   .readOnly 292 (0444)
@@ -20,6 +21,32 @@
 //     fs.copyFile(from, to, overwrite?)      overwrite defaults to true
 //     fs.removeFile(path)
 //     fs.move(from, to)                      rename; copies + deletes across devices
+//
+// Chunked reading (big files: only one chunk is in memory at a time)
+//     fs.chunkPlan(sizeOrPath, spec?)        --> { size, chunkSize, chunkCount, lastChunkSize }
+//     fs.openReader(path, spec?)             --> reader (regular files only)
+//         reader:read()                      --> next chunk, or nil after the last one
+//         reader:readChunk(index)            --> chunk number `index` (1-based), in any order
+//         reader:chunks()                    for index, chunk in reader:chunks() do ... end
+//         reader:rewind()                    makes read() start again at chunk 1
+//         reader:plan()                      --> the same table fs.chunkPlan returns
+//         reader:close()                     releases the file now; calling it twice is fine
+//
+//     spec decides the chunk size:
+//         nil or "auto"   size / 64, rounded up to a multiple of 4 KiB, kept within
+//                         64 KiB .. 4 MiB. A heuristic that bounds memory per chunk;
+//                         it is not tuned to any particular disk or workload.
+//         { count = n }   aim for n chunks: chunkSize = ceil(size / n). Every chunk has the
+//                         same size except the last (shorter), so the real count can be
+//                         lower than n (10 bytes with count = 6 -> 5 chunks of 2 bytes),
+//                         never higher.
+//         { size = n }    exactly n bytes per chunk (1 .. fs.maxChunkSize); last may be shorter.
+//
+//     chunkPlan accepts a size in bytes (pure arithmetic, touches no file) or a path.
+//     An empty file has 0 chunks. The plan is fixed when the reader opens: if the file
+//     shrinks afterwards read() raises; bytes appended afterwards are not seen.
+//     read(), readChunk() and chunks() do not disturb each other: only read() moves the
+//     read() position. A reader keeps its file open until close() or until it is collected.
 //
 // Directories
 //     fs.makeDir(path, recursive?)           non-recursive fails if it already exists
@@ -74,11 +101,14 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <new>
 #include <random>
 #include <string>
 #include <string_view>
@@ -786,6 +816,335 @@ int chmodImpl(lua_State* L, std::string_view pathText, int mode) {
     return 0;
 }
 
+// Chunked reading ///////////////////////////
+
+// A chunk becomes one Lua string, so it can be no larger than one.
+constexpr std::uintmax_t kMaxChunkSize = kMaxReadSize;
+
+// "auto": about kAutoTargetChunks chunks, each a multiple of kAutoAlignment bytes and
+// within kAutoMinChunk .. kAutoMaxChunk. A heuristic, not tuned to any particular disk.
+constexpr std::uintmax_t kAutoTargetChunks = 64;
+constexpr std::uintmax_t kAutoAlignment = 4096;
+constexpr std::uintmax_t kAutoMinChunk = std::uintmax_t{64} << 10;
+constexpr std::uintmax_t kAutoMaxChunk = std::uintmax_t{4} << 20;
+
+// Lua numbers are doubles; whole numbers are exact up to 2^53.
+constexpr double kMaxExactInteger = 9007199254740992.0;
+
+struct ChunkSpec {
+    enum class Kind { Auto, Count, Size };
+    Kind kind = Kind::Auto;
+    std::uintmax_t value = 0; // the count or the size, depending on kind
+};
+
+struct ChunkPlan {
+    std::uintmax_t size = 0;          // file size in bytes
+    std::uintmax_t chunkSize = 1;     // bytes per chunk; the last one may be shorter
+    std::uintmax_t chunkCount = 0;
+    std::uintmax_t lastChunkSize = 0; // 0 for an empty file
+};
+
+std::uintmax_t ceilDiv(std::uintmax_t a, std::uintmax_t b) {
+    return a / b + (a % b != 0 ? 1 : 0);
+}
+
+// The ways to pick a chunk size. They only do arithmetic. A literal size needs no
+// function: checkChunkSpec() validates it and planChunks() uses it as it is.
+
+// Overall size divided by the target count, rounded up so that the result never has
+// more chunks than asked for. count must be >= 1. May return 0 (empty file).
+std::uintmax_t chunkSizeForCount(std::uintmax_t fileSize, std::uintmax_t count) {
+    return ceilDiv(fileSize, count);
+}
+
+// Roughly fileSize / kAutoTargetChunks, rounded up to the alignment, then clamped.
+// Small files get one chunk of 64 KiB (or fewer); huge files get 4 MiB chunks.
+std::uintmax_t chunkSizeAuto(std::uintmax_t fileSize) {
+    const std::uintmax_t wanted = ceilDiv(fileSize / kAutoTargetChunks, kAutoAlignment) * kAutoAlignment;
+    return std::clamp(wanted, kAutoMinChunk, kAutoMaxChunk);
+}
+
+// Turns a spec into a plan for a file of fileSize bytes. Returns false and sets reason if
+// the spec cannot be honoured.
+bool planChunks(std::uintmax_t fileSize, const ChunkSpec& spec, ChunkPlan& plan,
+                std::string& reason) {
+    std::uintmax_t chunk = 0;
+    switch (spec.kind) {
+    case ChunkSpec::Kind::Count:
+        chunk = std::max<std::uintmax_t>(chunkSizeForCount(fileSize, spec.value), 1);
+        break;
+    case ChunkSpec::Kind::Size:
+        chunk = spec.value;
+        break;
+    default:
+        chunk = chunkSizeAuto(fileSize);
+        break;
+    }
+
+    // Only reachable with { count = n } on a very large file: a literal size is checked
+    // when the spec is read, and "auto" stays far below the limit.
+    if (chunk > kMaxChunkSize) {
+        reason = "a file of " + std::to_string(fileSize) + " bytes needs at least " +
+                 std::to_string(ceilDiv(fileSize, kMaxChunkSize)) +
+                 " chunks (one chunk cannot exceed " + std::to_string(kMaxChunkSize) + " bytes)";
+        return false;
+    }
+
+    plan.size = fileSize;
+    plan.chunkSize = chunk;
+    plan.chunkCount = ceilDiv(fileSize, chunk);
+    plan.lastChunkSize = plan.chunkCount == 0 ? 0 : fileSize - (plan.chunkCount - 1) * chunk;
+    return true;
+}
+
+// The size of a regular file. Pipes, devices and sockets have no meaningful size, so
+// they are refused instead of being "streamed" with a made-up plan.
+bool regularFileSize(const stdfs::path& path, std::uintmax_t& size, std::string& reason) {
+    std::error_code ec;
+    const stdfs::file_status status = stdfs::status(path, ec);
+    if (status.type() == stdfs::file_type::not_found) {
+        reason = reasonOf(std::errc::no_such_file_or_directory);
+        return false;
+    }
+    if (stdfs::is_directory(status)) {
+        reason = reasonOf(std::errc::is_a_directory);
+        return false;
+    }
+    if (ec) {
+        reason = describe(ec);
+        return false;
+    }
+    if (!stdfs::is_regular_file(status)) {
+        reason = "not a regular file";
+        return false;
+    }
+    size = stdfs::file_size(path, ec);
+    if (ec) {
+        reason = describe(ec);
+        return false;
+    }
+    return true;
+}
+
+struct Reader {
+    std::ifstream in;
+    std::string path;        // as the script wrote it, for error messages
+    ChunkPlan plan;
+    std::uintmax_t next = 0; // 0-based index of the chunk read() returns next
+    std::string buffer;      // holds the chunk just read; reused, so no allocation per chunk
+};
+
+// What the Lua userdata holds. The Reader lives on the heap and the userdata only has a
+// pointer to it (null until the Reader exists), so the userdata is destroyed correctly
+// whatever happens while it is being set up.
+struct ReaderHandle {
+    Reader* reader;
+};
+
+constexpr const char* kReaderMeta = "sonata.fs.Reader";
+
+void destroyReaderHandle(lua_State* L, void* memory) {
+    ReaderHandle* handle = static_cast<ReaderHandle*>(memory);
+    delete handle->reader;
+    handle->reader = nullptr;
+}
+
+bool openReader(Reader& reader, std::string_view pathText, const ChunkSpec& spec,
+                std::string& reason) {
+    const stdfs::path path = toPath(pathText);
+
+    std::uintmax_t size = 0;
+    if (!regularFileSize(path, size, reason)) {
+        return false;
+    }
+    if (size > static_cast<std::uintmax_t>(std::numeric_limits<std::streamoff>::max())) {
+        reason = "file is too large";
+        return false;
+    }
+
+    ChunkPlan plan;
+    if (!planChunks(size, spec, plan, reason)) {
+        return false;
+    }
+
+    reader.in.open(path, std::ios::binary);
+    if (!reader.in) {
+        reason = errnoReason(errno);
+        return false;
+    }
+    reader.path.assign(pathText);
+    reader.plan = plan;
+    reader.next = 0;
+    return true;
+}
+
+// Reads chunk `index` (0-based, below plan.chunkCount) into reader.buffer. Every chunk is
+// read from its own offset, so the order in which chunks are asked for does not matter.
+bool readChunkBytes(Reader& reader, std::uintmax_t index, std::string& reason) {
+    const std::uintmax_t offset = index * reader.plan.chunkSize; // < size, cannot overflow
+    const std::uintmax_t length = std::min(reader.plan.chunkSize, reader.plan.size - offset);
+
+    try {
+        reader.buffer.resize(static_cast<std::size_t>(length));
+    } catch (const std::exception&) {
+        reason = "out of memory";
+        return false;
+    }
+
+    reader.in.clear();
+    reader.in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!reader.in) {
+        reason = "seek error";
+        return false;
+    }
+    reader.in.read(reader.buffer.data(), static_cast<std::streamsize>(length));
+    if (static_cast<std::uintmax_t>(reader.in.gcount()) != length) {
+        reason = reader.in.bad() ? "read error" : "file was truncated while being read";
+        return false;
+    }
+    return true;
+}
+
+bool wholeNumber(double value, double min, double max) {
+    return value >= min && value <= max && value == std::floor(value); // false for NaN
+}
+
+// nil / "auto" / { count = n } / { size = n }. Raises on anything else.
+ChunkSpec checkChunkSpec(lua_State* L, int arg) {
+    ChunkSpec spec;
+    if (lua_isnoneornil(L, arg)) {
+        return spec;
+    }
+    if (lua_type(L, arg) == LUA_TSTRING) {
+        std::size_t length = 0;
+        const char* text = luaL_checklstring(L, arg, &length);
+        luaL_argcheck(L, std::string_view(text, length) == "auto", arg,
+                      "chunk spec must be \"auto\", { count = n } or { size = n }");
+        return spec;
+    }
+
+    luaL_checktype(L, arg, LUA_TTABLE);
+    lua_getfield(L, arg, "count");
+    lua_getfield(L, arg, "size");
+    const bool hasCount = !lua_isnil(L, -2);
+    const bool hasSize = !lua_isnil(L, -1);
+    luaL_argcheck(L, hasCount != hasSize, arg,
+                  "chunk spec needs exactly one of 'count' or 'size'");
+
+    const int valueIndex = hasCount ? -2 : -1;
+    luaL_argcheck(L, lua_type(L, valueIndex) == LUA_TNUMBER, arg,
+                  "chunk spec 'count' or 'size' must be a number");
+    const double value = luaL_checknumber(L, valueIndex);
+    if (hasCount) {
+        luaL_argcheck(L, wholeNumber(value, 1, kMaxExactInteger), arg,
+                      "'count' must be a whole number of at least 1");
+        spec.kind = ChunkSpec::Kind::Count;
+    } else {
+        luaL_argcheck(L, wholeNumber(value, 1, static_cast<double>(kMaxChunkSize)), arg,
+                      "'size' must be a whole number from 1 to fs.maxChunkSize");
+        spec.kind = ChunkSpec::Kind::Size;
+    }
+    spec.value = static_cast<std::uintmax_t>(value);
+    lua_pop(L, 2);
+    return spec;
+}
+
+void pushPlan(lua_State* L, const ChunkPlan& plan) {
+    lua_createtable(L, 0, 4);
+    setNumberField(L, "size", static_cast<double>(plan.size));
+    setNumberField(L, "chunkSize", static_cast<double>(plan.chunkSize));
+    setNumberField(L, "chunkCount", static_cast<double>(plan.chunkCount));
+    setNumberField(L, "lastChunkSize", static_cast<double>(plan.lastChunkSize));
+}
+
+int chunkPlanImpl(lua_State* L, bool fromPath, std::string_view pathText, std::uintmax_t size,
+                  const ChunkSpec& spec) {
+    std::string reason;
+    if (fromPath && !regularFileSize(toPath(pathText), size, reason)) {
+        return fail(L, "chunkPlan", quote(pathText), reason);
+    }
+
+    ChunkPlan plan;
+    if (!planChunks(size, spec, plan, reason)) {
+        return fail(L, "chunkPlan", fromPath ? quote(pathText) : std::string(), reason);
+    }
+    pushPlan(L, plan);
+    return 1;
+}
+
+int openReaderImpl(lua_State* L, std::string_view pathText, const ChunkSpec& spec) {
+    // The userdata goes first and starts out empty and valid; it is left on the stack below
+    // an error message if anything later fails, and the garbage collector cleans it up.
+    ReaderHandle* handle = static_cast<ReaderHandle*>(
+        lua_newuserdatadtor(L, sizeof(ReaderHandle), destroyReaderHandle));
+    handle->reader = nullptr;
+    lua_getfield(L, LUA_REGISTRYINDEX, kReaderMeta);
+    lua_setmetatable(L, -2);
+
+    try {
+        handle->reader = new Reader();
+    } catch (const std::bad_alloc&) {
+        return fail(L, "openReader", quote(pathText), "out of memory");
+    }
+
+    std::string reason;
+    if (!openReader(*handle->reader, pathText, spec, reason)) {
+        return fail(L, "openReader", quote(pathText), reason);
+    }
+    return 1; // the reader is on top of the stack
+}
+
+int failClosed(lua_State* L, const char* op, const Reader& reader) {
+    return fail(L, op, quote(reader.path), "reader is closed");
+}
+
+// Pushes chunk `index` (0-based). The reader must be open and the index in range.
+int pushChunk(lua_State* L, const char* op, Reader& reader, std::uintmax_t index) {
+    std::string reason;
+    if (!readChunkBytes(reader, index, reason)) {
+        return fail(L, op, quote(reader.path), reason);
+    }
+    pushString(L, reader.buffer);
+    return 1;
+}
+
+int readNextImpl(lua_State* L, Reader& reader) {
+    if (!reader.in.is_open()) {
+        return failClosed(L, "read", reader);
+    }
+    if (reader.next >= reader.plan.chunkCount) {
+        lua_pushnil(L);
+        return 1;
+    }
+    const int results = pushChunk(L, "read", reader, reader.next);
+    if (results >= 0) {
+        ++reader.next; // a failed read can be retried
+    }
+    return results;
+}
+
+int readChunkImpl(lua_State* L, Reader& reader, std::uintmax_t index) {
+    if (!reader.in.is_open()) {
+        return failClosed(L, "readChunk", reader);
+    }
+    return pushChunk(L, "readChunk", reader, index);
+}
+
+// Stateless iterator behind reader:chunks(): given the previous index it returns the next
+// (index, chunk) pair, or nil. All progress lives in the control variable of the loop.
+int nextChunkImpl(lua_State* L, Reader& reader, double previous) {
+    if (!reader.in.is_open()) {
+        return failClosed(L, "chunks", reader);
+    }
+    if (previous >= static_cast<double>(reader.plan.chunkCount)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushnumber(L, previous + 1);
+    const int results = pushChunk(L, "chunks", reader, static_cast<std::uintmax_t>(previous));
+    return results < 0 ? results : 2;
+}
+
 // Bindings /////////////////////////////////
 
 // fs.readFile(path: string): string
@@ -963,6 +1322,117 @@ int fsMakeTempDir(lua_State* L) {
     return finish(L, makeTempDirImpl(L, text));
 }
 
+// fs.chunkPlan(sizeOrPath: number | string, spec: ChunkSpec?):
+//     { size: number, chunkSize: number, chunkCount: number, lastChunkSize: number }
+int fsChunkPlan(lua_State* L) {
+    const bool fromPath = lua_type(L, 1) != LUA_TNUMBER;
+    std::string_view path;
+    std::uintmax_t size = 0;
+    if (fromPath) {
+        path = checkPath(L, 1);
+    } else {
+        const double bytes = luaL_checknumber(L, 1);
+        luaL_argcheck(L, wholeNumber(bytes, 0, kMaxExactInteger), 1,
+                      "file size must be a whole number of bytes");
+        size = static_cast<std::uintmax_t>(bytes);
+    }
+    const ChunkSpec spec = checkChunkSpec(L, 2);
+    return finish(L, chunkPlanImpl(L, fromPath, path, size, spec));
+}
+
+// fs.openReader(path: string, spec: ChunkSpec?): Reader
+int fsOpenReader(lua_State* L) {
+    const std::string_view path = checkPath(L, 1);
+    const ChunkSpec spec = checkChunkSpec(L, 2);
+    return finish(L, openReaderImpl(L, path, spec));
+}
+
+// Reader methods ///////////////////////////
+
+ReaderHandle* checkHandle(lua_State* L, int arg) {
+    return static_cast<ReaderHandle*>(luaL_checkudata(L, arg, kReaderMeta));
+}
+
+// reader:read(): string?
+int fsReaderRead(lua_State* L) {
+    ReaderHandle* handle = checkHandle(L, 1);
+    return finish(L, readNextImpl(L, *handle->reader));
+}
+
+// reader:readChunk(index: number): string
+int fsReaderReadChunk(lua_State* L) {
+    ReaderHandle* handle = checkHandle(L, 1);
+    const double index = luaL_checknumber(L, 2);
+    luaL_argcheck(L, wholeNumber(index, 1, static_cast<double>(handle->reader->plan.chunkCount)),
+                  2, "chunk index out of range (chunks are numbered from 1)");
+    return finish(L, readChunkImpl(L, *handle->reader, static_cast<std::uintmax_t>(index) - 1));
+}
+
+// The iterator function returned by reader:chunks(): (reader, previousIndex) -> (index, chunk)
+int fsChunkIterator(lua_State* L) {
+    ReaderHandle* handle = checkHandle(L, 1);
+    const double previous = luaL_checknumber(L, 2);
+    luaL_argcheck(L, wholeNumber(previous, 0, kMaxExactInteger), 2,
+                  "previous chunk index must be a whole number");
+    return finish(L, nextChunkImpl(L, *handle->reader, previous));
+}
+
+// reader:chunks(): (iterator, reader, 0), for `for index, chunk in reader:chunks() do`
+int fsReaderChunks(lua_State* L) {
+    checkHandle(L, 1);
+    lua_pushcfunction(L, fsChunkIterator, "chunkIterator");
+    lua_pushvalue(L, 1);
+    lua_pushnumber(L, 0);
+    return 3;
+}
+
+// reader:rewind()
+int fsReaderRewind(lua_State* L) {
+    ReaderHandle* handle = checkHandle(L, 1);
+    handle->reader->next = 0;
+    return 0;
+}
+
+// reader:plan(): { size, chunkSize, chunkCount, lastChunkSize }
+int fsReaderPlan(lua_State* L) {
+    ReaderHandle* handle = checkHandle(L, 1);
+    pushPlan(L, handle->reader->plan);
+    return 1;
+}
+
+// reader:close()
+int fsReaderClose(lua_State* L) {
+    ReaderHandle* handle = checkHandle(L, 1);
+    Reader& reader = *handle->reader;
+    if (reader.in.is_open()) {
+        reader.in.close();
+    }
+    std::string().swap(reader.buffer); // give the chunk memory back too
+    return 0;
+}
+
+constexpr NativeFunction kReaderMethods[] = {
+    {"read", fsReaderRead},
+    {"readChunk", fsReaderReadChunk},
+    {"chunks", fsReaderChunks},
+    {"rewind", fsReaderRewind},
+    {"plan", fsReaderPlan},
+    {"close", fsReaderClose},
+};
+
+// Creates the reader's metatable once per Lua state; leaves the stack as it found it.
+void registerReaderType(lua_State* L) {
+    if (luaL_newmetatable(L, kReaderMeta) != 0) {
+        lua_createtable(L, 0, static_cast<int>(std::size(kReaderMethods)));
+        setFunctions(L, kReaderMethods);
+        lua_setreadonly(L, -1, 1);
+        lua_setfield(L, -2, "__index");
+        setStringField(L, "__type", "FsReader"); // what typeof(reader) reports
+        lua_setreadonly(L, -1, 1);
+    }
+    lua_pop(L, 1);
+}
+
 constexpr NativeFunction kFunctions[] = {
     {"readFile", fsReadFile},
     {"writeFile", fsWriteFile},
@@ -989,13 +1459,15 @@ constexpr NativeFunction kFunctions[] = {
     {"chdir", fsChdir},
     {"tempDir", fsTempDir},
     {"makeTempDir", fsMakeTempDir},
+    {"chunkPlan", fsChunkPlan},
+    {"openReader", fsOpenReader},
 };
 
 } // namespace
 
 
 void openFs(lua_State* L) {
-    lua_createtable(L, 0, static_cast<int>(std::size(kFunctions)) + 3);
+    lua_createtable(L, 0, static_cast<int>(std::size(kFunctions)) + 4);
     setFunctions(L, kFunctions);
 
     lua_pushnumber(L, 1);
@@ -1003,6 +1475,11 @@ void openFs(lua_State* L) {
 
     lua_pushnumber(L, static_cast<double>(kMaxReadSize));
     lua_setfield(L, -2, "maxReadSize");
+
+    lua_pushnumber(L, static_cast<double>(kMaxChunkSize));
+    lua_setfield(L, -2, "maxChunkSize");
+
+    registerReaderType(L);
 
     lua_createtable(L, 0, 6);
     setNumberField(L, "file", 0644);
