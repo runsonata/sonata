@@ -78,6 +78,45 @@
 //     fs.tempDir()                           --> the system temp directory
 //     fs.makeTempDir(prefix?)                --> a new, empty, private directory inside it
 //
+// Finding files
+//     fs.walk(dir, options?)                 --> iterator: for entry in fs.walk("src") do ... end
+//         entry = { path = "sub/a.txt", fullPath = "src/sub/a.txt", name = "a.txt",
+//                   kind = "file" | "directory" | "symlink" | "other", depth = 2 }
+//         Depth first, a directory before what is in it, names sorted within each directory.
+//         options: maxDepth (number, default unlimited), followSymlinks (false: links are
+//                  reported, not entered), filter = function(entry): boolean (false skips the
+//                  entry, and for a directory everything in it), dirs (true: report directories)
+//     fs.glob(pattern, options?)             --> { string }  matching paths, sorted
+//         "*" any characters but "/", "?" one character, "[abc]" "[a-z]" "[!abc]" one of a set,
+//         "**" any number of directories, "{a,b}" alternatives, "\\" escapes the next character.
+//         Names starting with "." only match patterns that spell the dot, unless dot = true.
+//         options: cwd (where relative patterns start, default "."), dot (false),
+//                  kind ("file" | "directory": only those), absolute (false: return paths as
+//                  the pattern wrote them, relative to cwd)
+//     fs.match(pattern, path, options?)      --> boolean  the same rules, without touching the disk
+//                                                (options: dot)
+//
+// Watching for changes
+//     fs.watch(path, options?)               --> Watcher  (a file, or a directory and what is in it)
+//         options: recursive (true), interval (seconds between checks, default 0.25)
+//         watcher:next(timeout?)             --> Event?   waits for the next change; nil on timeout
+//                                                         or once the watcher is closed
+//         watcher:poll()                     --> { Event }  the changes since the last look, now
+//         watcher:close()
+//         Event = { kind = "create" | "modify" | "remove", path = string, isDir = boolean }
+//     Changes are found by comparing what the files look like (size, modification time)
+//     every "interval", so very fast edits in between can show up as one "modify".
+//     next() lets other tasks run while it waits (see @sonata/task).
+//
+// Locking (advisory: only between programs that also lock)
+//     fs.lock(path, options?)                --> Lock | nil   waits for the lock; nil after "timeout"
+//         options: shared (false: exclusive), timeout (seconds, default: forever)
+//     fs.tryLock(path, options?)             --> Lock | nil   nil if someone else holds it
+//         lock:unlock()                      lock:isLocked() --> boolean
+//     The file is created if it does not exist, and left in place afterwards. A lock is
+//     released by unlock(), when it is collected, and when the program exits. Waiting in
+//     fs.lock lets other tasks run.
+//
 // Same behavior on every OS
 //     Paths you pass in may use "/" everywhere (Windows also accepts a backslash).
 //     Paths this library returns (realPath, cwd, tempDir, makeTempDir, readLink)
@@ -103,15 +142,22 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <new>
 #include <random>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #if __has_include(<version>)
@@ -119,9 +165,11 @@
 #endif
 
 #include <sonata/core/library.hpp>
+#include <sonata/core/scheduler.hpp>
 #include "lua.h"
 #include "lualib.h"
 
+#include "fs/oslock.hpp"
 #include "libs.hpp"
 
 namespace sonata::lib::libs {
@@ -1432,6 +1480,923 @@ void registerReaderType(lua_State* L) {
     lua_pop(L, 1);
 }
 
+// Finding files ////////////////////////////
+
+// One entry of a directory, as the walkers see it.
+struct DirEntry {
+    std::string name;
+    const char* kind;
+    stdfs::path path;
+};
+
+// The entries of "dir", sorted by name. Unreadable directories give none.
+std::vector<DirEntry> listSorted(const stdfs::path& dir) {
+    std::vector<DirEntry> entries;
+    std::error_code ec;
+    for (stdfs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code statusEc;
+        const stdfs::file_status status = it->symlink_status(statusEc);
+        entries.push_back(DirEntry{toUtf8(it->path().filename()), statusEc ? "other" : kindOf(status), it->path()});
+    }
+    std::sort(entries.begin(), entries.end(), [](const DirEntry& a, const DirEntry& b) { return a.name < b.name; });
+    return entries;
+}
+
+bool isDirectoryTarget(const stdfs::path& path) {
+    std::error_code ec;
+    return stdfs::is_directory(path, ec); // follows links
+}
+
+// ---- glob patterns
+
+bool hasMagic(std::string_view segment) {
+    return segment.find_first_of("*?[\\") != std::string_view::npos;
+}
+
+std::size_t utf8Size(unsigned char lead) {
+    if (lead < 0x80) return 1;
+    if ((lead >> 5) == 0x6) return 2;
+    if ((lead >> 4) == 0xE) return 3;
+    if ((lead >> 3) == 0x1E) return 4;
+    return 1;
+}
+
+std::uint32_t decodeAt(std::string_view text, std::size_t at, std::size_t& length) {
+    const auto lead = static_cast<unsigned char>(text[at]);
+    length = std::min(utf8Size(lead), text.size() - at);
+    if (length == 1) {
+        return lead;
+    }
+    std::uint32_t code = lead & (0xFF >> (length + 1));
+    for (std::size_t k = 1; k < length; ++k) {
+        code = (code << 6) | (static_cast<unsigned char>(text[at + k]) & 0x3F);
+    }
+    return code;
+}
+
+// Matches the character class starting at pat[p] ('[') against "c". Sets "end" past
+// the ']'. Returns -1 if the class has no closing ']' (then '[' is an ordinary character).
+int matchClass(std::string_view pat, std::size_t p, std::uint32_t c, std::size_t& end) {
+    std::size_t i = p + 1;
+    const bool negate = i < pat.size() && (pat[i] == '!' || pat[i] == '^');
+    if (negate) {
+        ++i;
+    }
+    bool matched = false;
+    bool first = true;
+    while (i < pat.size() && (pat[i] != ']' || first)) {
+        first = false;
+        std::size_t length = 0;
+        if (pat[i] == '\\' && i + 1 < pat.size()) {
+            ++i;
+        }
+        const std::uint32_t low = decodeAt(pat, i, length);
+        i += length;
+        std::uint32_t high = low;
+        if (i + 1 < pat.size() && pat[i] == '-' && pat[i + 1] != ']') {
+            ++i;
+            if (pat[i] == '\\' && i + 1 < pat.size()) {
+                ++i;
+            }
+            high = decodeAt(pat, i, length);
+            i += length;
+        }
+        matched = matched || (c >= low && c <= high);
+    }
+    if (i >= pat.size()) {
+        return -1;
+    }
+    end = i + 1;
+    return matched != negate ? 1 : 0;
+}
+
+// Matches one path segment: "*", "?", "[...]" and backslash escapes.
+bool matchSegment(std::string_view pat, std::string_view name) {
+    std::size_t p = 0;
+    std::size_t n = 0;
+    std::size_t starP = std::string_view::npos;
+    std::size_t starN = 0;
+
+    while (n < name.size()) {
+        if (p < pat.size()) {
+            const char c = pat[p];
+            std::size_t length = 0;
+            if (c == '*') {
+                starP = p++;
+                starN = n;
+                continue;
+            }
+            if (c == '?') {
+                decodeAt(name, n, length);
+                ++p;
+                n += length;
+                continue;
+            }
+            if (c == '[') {
+                std::size_t end = 0;
+                const std::uint32_t code = decodeAt(name, n, length);
+                const int result = matchClass(pat, p, code, end);
+                if (result == 1) {
+                    p = end;
+                    n += length;
+                    continue;
+                }
+                if (result == -1 && name[n] == '[') { // no closing ']': a literal '['
+                    ++p;
+                    ++n;
+                    continue;
+                }
+            } else if (c == '\\' && p + 1 < pat.size()) {
+                if (pat[p + 1] == name[n]) {
+                    p += 2;
+                    ++n;
+                    continue;
+                }
+            } else if (c == name[n]) {
+                ++p;
+                ++n;
+                continue;
+            }
+        }
+        if (starP == std::string_view::npos) {
+            return false;
+        }
+        p = starP + 1;
+        std::size_t length = 0;
+        decodeAt(name, starN, length);
+        starN += length;
+        n = starN;
+    }
+    while (p < pat.size() && pat[p] == '*') {
+        ++p;
+    }
+    return p == pat.size();
+}
+
+std::vector<std::string_view> splitSegments(std::string_view path) {
+    std::vector<std::string_view> parts;
+    std::size_t start = 0;
+    while (start <= path.size()) {
+        const std::size_t slash = path.find('/', start);
+        const std::string_view part = path.substr(start, slash == std::string_view::npos ? std::string_view::npos : slash - start);
+        if (!part.empty() && part != ".") {
+            parts.push_back(part);
+        }
+        if (slash == std::string_view::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    return parts;
+}
+
+bool hidden(std::string_view segment) {
+    return !segment.empty() && segment[0] == '.';
+}
+
+bool matchSegments(const std::vector<std::string_view>& pat, std::size_t pi, const std::vector<std::string_view>& path,
+                   std::size_t ni, bool dot) {
+    if (pi == pat.size()) {
+        return ni == path.size();
+    }
+    if (pat[pi] == "**") {
+        for (std::size_t k = ni; k <= path.size(); ++k) {
+            if (matchSegments(pat, pi + 1, path, k, dot)) {
+                return true;
+            }
+            if (k < path.size() && !dot && hidden(path[k])) {
+                return false; // "**" does not enter hidden directories
+            }
+        }
+        return false;
+    }
+    if (ni == path.size()) {
+        return false;
+    }
+    if (!dot && hidden(path[ni]) && !hidden(pat[pi])) {
+        return false;
+    }
+    return matchSegment(pat[pi], path[ni]) && matchSegments(pat, pi + 1, path, ni + 1, dot);
+}
+
+// "a{b,c{d,e}}f" -> "abf", "acdf", "acef". Braces without a matching '}' stay as they are.
+void expandBraces(const std::string& pattern, std::vector<std::string>& out) {
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+        if (pattern[i] == '\\') {
+            ++i;
+            continue;
+        }
+        if (pattern[i] != '{') {
+            continue;
+        }
+        int depth = 0;
+        std::vector<std::size_t> commas;
+        std::size_t close = std::string::npos;
+        for (std::size_t j = i; j < pattern.size(); ++j) {
+            if (pattern[j] == '\\') {
+                ++j;
+            } else if (pattern[j] == '{') {
+                ++depth;
+            } else if (pattern[j] == '}' && --depth == 0) {
+                close = j;
+                break;
+            } else if (pattern[j] == ',' && depth == 1) {
+                commas.push_back(j);
+            }
+        }
+        if (close == std::string::npos) {
+            break;
+        }
+        const std::string prefix = pattern.substr(0, i);
+        const std::string suffix = pattern.substr(close + 1);
+        std::size_t start = i + 1;
+        commas.push_back(close);
+        for (const std::size_t comma : commas) {
+            expandBraces(prefix + pattern.substr(start, comma - start) + suffix, out);
+            start = comma + 1;
+        }
+        return;
+    }
+    out.push_back(pattern);
+}
+
+// Paths compared with patterns use "/" (and no leading "./").
+std::string normalizeSlashes(std::string_view text) {
+    std::string out(text);
+#ifdef _WIN32
+    std::replace(out.begin(), out.end(), '\\', '/');
+#endif
+    while (out.size() >= 2 && out[0] == '.' && out[1] == '/') {
+        out.erase(0, 2);
+    }
+    return out;
+}
+
+// Splits an absolute pattern's root ("/", "C:/") off. Empty for relative patterns.
+std::string patternRoot(const std::string& pattern) {
+    if (!pattern.empty() && pattern[0] == '/') {
+        return "/";
+    }
+    if (pattern.size() >= 3 && std::isalpha(static_cast<unsigned char>(pattern[0])) && pattern[1] == ':' && pattern[2] == '/') {
+        return pattern.substr(0, 3);
+    }
+    return {};
+}
+
+struct GlobOptions {
+    stdfs::path cwd = ".";
+    bool dot = false;
+    bool absolute = false;
+    const char* kind = nullptr; // "file" / "directory" / nullptr = anything
+};
+
+// Walks "dir" (relative path "rel" from the glob's base), testing every entry.
+void globWalk(const stdfs::path& dir, const std::string& rel, std::size_t depth, std::size_t maxDepth,
+              const std::vector<std::string_view>& segments, const GlobOptions& options, const std::string& prefix,
+              std::set<std::string>& found) {
+    for (const DirEntry& entry : listSorted(dir)) {
+        const std::string path = rel.empty() ? entry.name : rel + "/" + entry.name;
+        const std::vector<std::string_view> parts = splitSegments(path);
+        const bool isDir = std::strcmp(entry.kind, "directory") == 0 ||
+                           (std::strcmp(entry.kind, "symlink") == 0 && isDirectoryTarget(entry.path));
+
+        if (matchSegments(segments, 0, parts, 0, options.dot)) {
+            const bool kindOk = options.kind == nullptr || (std::strcmp(options.kind, "directory") == 0 ? isDir : !isDir && std::strcmp(entry.kind, "other") != 0);
+            if (kindOk) {
+                found.insert(prefix + path);
+            }
+        }
+        const bool enter = std::strcmp(entry.kind, "directory") == 0 && depth + 1 < maxDepth &&
+                           (options.dot || !hidden(entry.name));
+        if (enter) {
+            globWalk(entry.path, path, depth + 1, maxDepth, segments, options, prefix, found);
+        }
+    }
+}
+
+void globOne(const std::string& rawPattern, const GlobOptions& options, std::set<std::string>& found) {
+    const std::string pattern = normalizeSlashes(rawPattern);
+    const std::string root = patternRoot(pattern);
+    const std::vector<std::string_view> all = splitSegments(std::string_view(pattern).substr(root.size()));
+
+    // Leading segments without wildcards are a plain directory to start from.
+    std::size_t literal = 0;
+    while (literal < all.size() && !hasMagic(all[literal]) && all[literal] != "**") {
+        ++literal;
+    }
+
+    std::string prefix = root;
+    for (std::size_t i = 0; i < literal; ++i) {
+        prefix += std::string(all[i]);
+        prefix += '/';
+    }
+
+    const stdfs::path base = root.empty() ? options.cwd / toPath(prefix) : toPath(prefix);
+    std::string shownPrefix = prefix;
+    if (options.absolute && root.empty()) {
+        std::error_code ec;
+        const stdfs::path absoluteBase = stdfs::absolute(options.cwd, ec).lexically_normal();
+        shownPrefix = toGenericUtf8(withoutTrailingSeparator(absoluteBase)) + "/" + prefix;
+    }
+
+    if (literal == all.size()) { // no wildcard at all: it either exists or not
+        std::error_code ec;
+        const stdfs::path target = root.empty() ? options.cwd / toPath(pattern) : toPath(pattern);
+        if (stdfs::exists(stdfs::symlink_status(target, ec))) {
+            const bool isDir = stdfs::is_directory(target, ec);
+            if (options.kind == nullptr || (std::strcmp(options.kind, "directory") == 0) == isDir) {
+                std::string shown = shownPrefix;
+                if (!shown.empty() && shown.back() == '/' && shown != root) {
+                    shown.pop_back();
+                }
+                found.insert(shown.empty() ? pattern : shown);
+            }
+        }
+        return;
+    }
+
+    const std::vector<std::string_view> rest(all.begin() + static_cast<std::ptrdiff_t>(literal), all.end());
+    const bool deep = std::find(rest.begin(), rest.end(), std::string_view("**")) != rest.end();
+    const std::size_t maxDepth = deep ? std::numeric_limits<std::size_t>::max() : rest.size();
+
+    std::error_code ec;
+    if (stdfs::is_directory(base, ec)) {
+        globWalk(base, "", 0, maxDepth, rest, options, shownPrefix, found);
+    }
+}
+
+// ---- fs.walk
+
+struct WalkFrame {
+    std::vector<DirEntry> entries;
+    std::size_t next = 0;
+    std::string rel; // of the directory, "" for the root
+    int depth = 0;   // of its entries
+};
+
+struct Walker {
+    stdfs::path root;
+    std::string rootText;
+    std::vector<WalkFrame> stack;
+    double maxDepth = std::numeric_limits<double>::infinity();
+    bool follow = false;
+    bool dirs = true;
+    std::set<stdfs::path> visited; // real paths of the directories entered (with follow: no loops)
+};
+
+constexpr const char* kWalkerMeta = "sonata.fs.Walker";
+
+void pushWalkEntry(lua_State* L, const Walker& walker, const DirEntry& entry, const std::string& rel, int depth) {
+    lua_createtable(L, 0, 5);
+    setStringField(L, "path", rel);
+    std::string full = walker.rootText;
+    if (!full.empty() && full.back() != '/') {
+        full += '/';
+    }
+    full += rel;
+    setStringField(L, "fullPath", full);
+    setStringField(L, "name", entry.name);
+    setStringField(L, "kind", entry.kind);
+    setNumberField(L, "depth", depth);
+}
+
+// The iterator behind fs.walk. Upvalue 1: the Walker userdata; upvalue 2: the filter (or nil).
+int walkNext(lua_State* L) {
+    auto* walker = static_cast<Walker*>(lua_touserdata(L, lua_upvalueindex(1)));
+    const bool hasFilter = lua_isfunction(L, lua_upvalueindex(2));
+
+    while (!walker->stack.empty()) {
+        WalkFrame& frame = walker->stack.back();
+        if (frame.next >= frame.entries.size()) {
+            walker->stack.pop_back();
+            continue;
+        }
+        const DirEntry entry = frame.entries[frame.next++];
+        const std::string rel = frame.rel.empty() ? entry.name : frame.rel + "/" + entry.name;
+        const int depth = frame.depth;
+
+        const bool isDir = std::strcmp(entry.kind, "directory") == 0 ||
+                           (walker->follow && std::strcmp(entry.kind, "symlink") == 0 && isDirectoryTarget(entry.path));
+
+        pushWalkEntry(L, *walker, entry, rel, depth);
+        if (hasFilter) {
+            lua_pushvalue(L, lua_upvalueindex(2));
+            lua_pushvalue(L, -2);
+            lua_call(L, 1, 1);
+            const bool keep = lua_toboolean(L, -1) != 0;
+            lua_pop(L, 1);
+            if (!keep) {
+                lua_pop(L, 1);
+                continue;
+            }
+        }
+
+        if (isDir && depth < walker->maxDepth) {
+            std::error_code ec;
+            const stdfs::path real = stdfs::canonical(entry.path, ec);
+            if (!ec && walker->visited.insert(real).second) {
+                walker->stack.push_back(WalkFrame{listSorted(entry.path), 0, rel, depth + 1});
+            }
+        }
+        if (isDir && !walker->dirs) {
+            lua_pop(L, 1);
+            continue;
+        }
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+// ---- Watching
+
+struct FileState {
+    const char* kind;
+    std::uintmax_t size;
+    stdfs::file_time_type modified;
+};
+
+using Snapshot = std::map<std::string, FileState>; // relative path ("" = the root itself) -> state
+
+struct WatchEvent {
+    const char* kind;
+    std::string path;
+    bool isDir;
+};
+
+struct WatchState {
+    std::mutex mutex;
+    stdfs::path root;
+    std::string rootText;
+    bool recursive = true;
+    double interval = 0.25;
+    Snapshot last;
+    std::deque<WatchEvent> pending;
+    bool closed = false;
+};
+
+struct Watcher {
+    std::shared_ptr<WatchState> state;
+};
+
+constexpr const char* kWatcherMeta = "sonata.fs.Watcher";
+
+FileState stateOf(const stdfs::path& path, const stdfs::file_status& status) {
+    std::error_code ec;
+    FileState state{kindOf(status), 0, stdfs::file_time_type{}};
+    if (status.type() == stdfs::file_type::regular) {
+        state.size = stdfs::file_size(path, ec);
+    }
+    state.modified = stdfs::last_write_time(path, ec);
+    return state;
+}
+
+void scanInto(const stdfs::path& dir, const std::string& rel, bool recursive, Snapshot& out) {
+    std::error_code ec;
+    for (stdfs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code statusEc;
+        const stdfs::file_status status = it->symlink_status(statusEc);
+        if (statusEc) {
+            continue;
+        }
+        const std::string path = rel.empty() ? toUtf8(it->path().filename()) : rel + "/" + toUtf8(it->path().filename());
+        out[path] = stateOf(it->path(), status);
+        if (recursive && status.type() == stdfs::file_type::directory) {
+            scanInto(it->path(), path, true, out);
+        }
+    }
+}
+
+Snapshot scan(const WatchState& state) {
+    Snapshot snapshot;
+    std::error_code ec;
+    const stdfs::file_status status = stdfs::symlink_status(state.root, ec);
+    if (ec || !stdfs::exists(status)) {
+        return snapshot;
+    }
+    snapshot[""] = stateOf(state.root, status);
+    if (status.type() == stdfs::file_type::directory) {
+        scanInto(state.root, "", state.recursive, snapshot);
+    }
+    return snapshot;
+}
+
+std::string eventPath(const WatchState& state, const std::string& rel) {
+    if (rel.empty()) {
+        return state.rootText;
+    }
+    std::string path = state.rootText;
+    if (!path.empty() && path.back() != '/') {
+        path += '/';
+    }
+    return path + rel;
+}
+
+// Compares a new snapshot with the last one and queues the differences. Caller holds the mutex.
+void diffInto(WatchState& state, Snapshot next) {
+    for (const auto& [rel, now] : next) {
+        const auto old = state.last.find(rel);
+        const bool isDir = std::strcmp(now.kind, "directory") == 0;
+        if (old == state.last.end()) {
+            state.pending.push_back(WatchEvent{"create", eventPath(state, rel), isDir});
+        } else if (std::strcmp(old->second.kind, now.kind) != 0) {
+            state.pending.push_back(WatchEvent{"remove", eventPath(state, rel), std::strcmp(old->second.kind, "directory") == 0});
+            state.pending.push_back(WatchEvent{"create", eventPath(state, rel), isDir});
+        } else if (!isDir && (old->second.size != now.size || old->second.modified != now.modified)) {
+            state.pending.push_back(WatchEvent{"modify", eventPath(state, rel), false});
+        }
+    }
+    for (const auto& [rel, old] : state.last) {
+        if (next.find(rel) == next.end()) {
+            state.pending.push_back(WatchEvent{"remove", eventPath(state, rel), std::strcmp(old.kind, "directory") == 0});
+        }
+    }
+    state.last = std::move(next);
+}
+
+void pushEvent(lua_State* L, const WatchEvent& event) {
+    lua_createtable(L, 0, 3);
+    setStringField(L, "kind", event.kind);
+    setStringField(L, "path", event.path);
+    lua_pushboolean(L, event.isDir);
+    lua_setfield(L, -2, "isDir");
+}
+
+Watcher* checkWatcher(lua_State* L) {
+    return static_cast<Watcher*>(luaL_checkudata(L, 1, kWatcherMeta));
+}
+
+// watcher:next: stack 1 watcher, 2 deadline (scheduler clock)
+int watchNextStep(lua_State* L);
+
+int watchNextK(lua_State* L, int) {
+    return watchNextStep(L);
+}
+
+int watchNextStep(lua_State* L) {
+    lua_settop(L, 2);
+    const std::shared_ptr<WatchState> state = checkWatcher(L)->state;
+    sched::Scheduler& scheduler = sched::Scheduler::of(L);
+
+    for (;;) {
+        double wait = 0;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->pending.empty()) {
+                const WatchEvent event = state->pending.front();
+                state->pending.pop_front();
+                pushEvent(L, event);
+                return 1;
+            }
+            if (state->closed) {
+                lua_pushnil(L);
+                return 1;
+            }
+            const double left = lua_tonumber(L, 2) - scheduler.now();
+            if (left <= 0) {
+                lua_pushnil(L);
+                return 1;
+            }
+            wait = std::min(state->interval, left);
+        }
+
+        const int r = scheduler.await(L, [state, wait]() -> sched::Completion {
+            std::this_thread::sleep_for(std::chrono::duration<double>(wait));
+            Snapshot next = scan(*state);
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->closed) {
+                diffInto(*state, std::move(next));
+            }
+            return [](lua_State*) { return 0; };
+        }, watchNextK);
+        if (r != sched::kInline) {
+            return r;
+        }
+        lua_settop(L, 2);
+    }
+}
+
+// watcher:next(timeout: number?): Event?
+int fsWatcherNext(lua_State* L) {
+    lua_settop(L, 2);
+    checkWatcher(L);
+    double deadline = std::numeric_limits<double>::infinity();
+    if (!lua_isnil(L, 2)) {
+        const double timeout = luaL_checknumber(L, 2);
+        luaL_argcheck(L, timeout >= 0, 2, "timeout must not be negative");
+        deadline = sched::Scheduler::of(L).now() + timeout;
+    }
+    lua_pushnumber(L, deadline);
+    lua_replace(L, 2);
+    return watchNextStep(L);
+}
+
+// watcher:poll(): { Event }
+int fsWatcherPoll(lua_State* L) {
+    const std::shared_ptr<WatchState> state = checkWatcher(L)->state;
+    std::deque<WatchEvent> events;
+    {
+        Snapshot next = scan(*state);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->closed) {
+            diffInto(*state, std::move(next));
+        }
+        events.swap(state->pending);
+    }
+    lua_createtable(L, static_cast<int>(events.size()), 0);
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        pushEvent(L, events[i]);
+        lua_rawseti(L, -2, static_cast<int>(i + 1));
+    }
+    return 1;
+}
+
+// watcher:close()
+int fsWatcherClose(lua_State* L) {
+    const std::shared_ptr<WatchState> state = checkWatcher(L)->state;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->closed = true;
+    state->pending.clear();
+    return 0;
+}
+
+// ---- Locks
+
+struct LockHandle {
+    std::shared_ptr<fslock::FileLock> lock;
+};
+
+constexpr const char* kLockMeta = "sonata.fs.Lock";
+
+LockHandle* checkLock(lua_State* L) {
+    return static_cast<LockHandle*>(luaL_checkudata(L, 1, kLockMeta));
+}
+
+// lock:unlock()
+int fsLockUnlock(lua_State* L) {
+    LockHandle* handle = checkLock(L);
+    if (handle->lock) {
+        handle->lock->release();
+    }
+    return 0;
+}
+
+// lock:isLocked(): boolean
+int fsLockIsLocked(lua_State* L) {
+    LockHandle* handle = checkLock(L);
+    lua_pushboolean(L, handle->lock && handle->lock->held());
+    return 1;
+}
+
+template <typename T>
+T* newUserdata(lua_State* L, const char* meta) {
+    void* memory = lua_newuserdatadtor(L, sizeof(T), [](lua_State*, void* p) { static_cast<T*>(p)->~T(); });
+    T* object = new (memory) T();
+    luaL_getmetatable(L, meta);
+    lua_setmetatable(L, -2);
+    return object;
+}
+
+// fs.lock / fs.tryLock. "tryOnly": never wait.
+int lockImpl(lua_State* L, bool tryOnly) {
+    const std::string_view pathText = checkPath(L, 1);
+    bool shared = false;
+    double timeout = tryOnly ? 0.0 : -1.0;
+    if (!lua_isnoneornil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TTABLE);
+        lua_getfield(L, 2, "shared");
+        shared = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);
+        if (!tryOnly) {
+            lua_getfield(L, 2, "timeout");
+            if (!lua_isnil(L, -1)) {
+                timeout = luaL_checknumber(L, -1);
+                luaL_argcheck(L, timeout >= 0, 2, "timeout must not be negative");
+            }
+            lua_pop(L, 1);
+        }
+    }
+
+    const char* op = tryOnly ? "tryLock" : "lock";
+    auto path = std::make_shared<stdfs::path>(toPath(pathText));
+    auto label = std::make_shared<std::string>(quote(pathText));
+    return sched::Scheduler::of(L).await(L, [path, label, shared, timeout, op]() -> sched::Completion {
+        auto error = std::make_shared<std::string>();
+        std::shared_ptr<fslock::FileLock> lock = fslock::acquire(*path, shared, timeout, *error);
+        return [lock, error, label, op](lua_State* T) {
+            if (!error->empty()) {
+                lua_pushfstring(T, "fs.%s %s: %s", op, label->c_str(), error->c_str());
+                return sched::kRaise;
+            }
+            if (!lock) {
+                lua_pushnil(T);
+                return 1;
+            }
+            newUserdata<LockHandle>(T, kLockMeta)->lock = lock;
+            return 1;
+        };
+    });
+}
+
+// fs.lock(path: string, options: { shared: boolean?, timeout: number? }?): Lock?
+int fsLock(lua_State* L) {
+    return lockImpl(L, false);
+}
+
+// fs.tryLock(path: string, options: { shared: boolean? }?): Lock?
+int fsTryLock(lua_State* L) {
+    return lockImpl(L, true);
+}
+
+// fs.walk(dir: string, options: WalkOptions?): () -> Entry?
+int fsWalk(lua_State* L) {
+    const std::string_view dirText = checkPath(L, 1);
+    double maxDepth = std::numeric_limits<double>::infinity();
+    bool follow = false;
+    bool dirs = true;
+    lua_settop(L, 2);
+    lua_pushnil(L); // 3: filter
+    if (!lua_isnil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TTABLE);
+        lua_getfield(L, 2, "maxDepth");
+        if (!lua_isnil(L, -1)) {
+            maxDepth = luaL_checknumber(L, -1);
+            luaL_argcheck(L, maxDepth >= 1, 2, "maxDepth must be at least 1");
+        }
+        lua_getfield(L, 2, "followSymlinks");
+        follow = lua_toboolean(L, -1) != 0;
+        lua_getfield(L, 2, "dirs");
+        dirs = lua_isnil(L, -1) || lua_toboolean(L, -1) != 0;
+        lua_getfield(L, 2, "filter");
+        luaL_argcheck(L, lua_isnil(L, -1) || lua_isfunction(L, -1), 2, "filter must be a function");
+        lua_replace(L, 3);
+        lua_settop(L, 3);
+    }
+
+    const stdfs::path dir = toPath(dirText);
+    {
+        std::error_code ec;
+        if (!stdfs::is_directory(dir, ec)) {
+            const bool exists = stdfs::exists(dir, ec);
+            fail(L, "walk", quote(dirText), exists ? reasonOf(std::errc::not_a_directory) : reasonOf(std::errc::no_such_file_or_directory));
+            return finish(L, kFailed);
+        }
+    }
+
+    Walker* walker = newUserdata<Walker>(L, kWalkerMeta);
+    walker->root = dir;
+    walker->rootText = normalizeSlashes(dirText);
+    walker->maxDepth = maxDepth;
+    walker->follow = follow;
+    walker->dirs = dirs;
+    std::error_code ec;
+    walker->visited.insert(stdfs::canonical(dir, ec));
+    walker->stack.push_back(WalkFrame{listSorted(dir), 0, "", 1});
+
+    lua_pushvalue(L, 3);
+    lua_pushcclosure(L, walkNext, "walk", 2);
+    return 1;
+}
+
+// fs.glob(pattern: string, options: GlobOptions?): { string }
+int fsGlob(lua_State* L) {
+    std::size_t length = 0;
+    const char* patternText = luaL_checklstring(L, 1, &length);
+    GlobOptions options;
+    if (!lua_isnoneornil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TTABLE);
+        lua_getfield(L, 2, "cwd");
+        if (!lua_isnil(L, -1)) {
+            options.cwd = toPath(checkPath(L, lua_gettop(L)));
+        }
+        lua_getfield(L, 2, "dot");
+        options.dot = lua_toboolean(L, -1) != 0;
+        lua_getfield(L, 2, "absolute");
+        options.absolute = lua_toboolean(L, -1) != 0;
+        lua_getfield(L, 2, "kind");
+        if (!lua_isnil(L, -1)) {
+            static const char* const kKinds[] = {"file", "directory", nullptr};
+            options.kind = kKinds[luaL_checkoption(L, -1, nullptr, kKinds)];
+        }
+    }
+
+    {
+        std::vector<std::string> patterns;
+        expandBraces(std::string(patternText, length), patterns);
+        std::set<std::string> found;
+        for (const std::string& pattern : patterns) {
+            globOne(pattern, options, found);
+        }
+
+        lua_createtable(L, static_cast<int>(found.size()), 0);
+        int i = 0;
+        for (const std::string& path : found) {
+            pushString(L, path);
+            lua_rawseti(L, -2, ++i);
+        }
+    }
+    return 1;
+}
+
+// fs.match(pattern: string, path: string, options: { dot: boolean? }?): boolean
+int fsMatch(lua_State* L) {
+    std::size_t patternLength = 0;
+    std::size_t pathLength = 0;
+    const char* patternText = luaL_checklstring(L, 1, &patternLength);
+    const char* pathText = luaL_checklstring(L, 2, &pathLength);
+    bool dot = false;
+    if (!lua_isnoneornil(L, 3)) {
+        luaL_checktype(L, 3, LUA_TTABLE);
+        lua_getfield(L, 3, "dot");
+        dot = lua_toboolean(L, -1) != 0;
+    }
+
+    bool matched = false;
+    {
+        const std::string path = normalizeSlashes(std::string_view(pathText, pathLength));
+        const std::string pathRoot = patternRoot(path);
+        const std::vector<std::string_view> parts = splitSegments(std::string_view(path).substr(pathRoot.size()));
+
+        std::vector<std::string> patterns;
+        expandBraces(std::string(patternText, patternLength), patterns);
+        for (const std::string& raw : patterns) {
+            const std::string pattern = normalizeSlashes(raw);
+            const std::string root = patternRoot(pattern);
+            if (root != pathRoot) {
+                continue;
+            }
+            const std::vector<std::string_view> segments = splitSegments(std::string_view(pattern).substr(root.size()));
+            if (matchSegments(segments, 0, parts, 0, dot)) {
+                matched = true;
+                break;
+            }
+        }
+    }
+    lua_pushboolean(L, matched);
+    return 1;
+}
+
+// fs.watch(path: string, options: { recursive: boolean?, interval: number? }?): Watcher
+int fsWatch(lua_State* L) {
+    const std::string_view pathText = checkPath(L, 1);
+    bool recursive = true;
+    double interval = 0.25;
+    if (!lua_isnoneornil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TTABLE);
+        lua_getfield(L, 2, "recursive");
+        recursive = lua_isnil(L, -1) || lua_toboolean(L, -1) != 0;
+        lua_getfield(L, 2, "interval");
+        if (!lua_isnil(L, -1)) {
+            interval = luaL_checknumber(L, -1);
+            luaL_argcheck(L, interval >= 0.01, 2, "interval must be at least 0.01 seconds");
+        }
+    }
+
+    {
+        std::error_code ec;
+        if (!stdfs::exists(toPath(pathText), ec)) {
+            fail(L, "watch", quote(pathText), reasonOf(std::errc::no_such_file_or_directory));
+            return finish(L, kFailed);
+        }
+    }
+
+    Watcher* watcher = newUserdata<Watcher>(L, kWatcherMeta);
+    watcher->state = std::make_shared<WatchState>();
+    WatchState& state = *watcher->state;
+    state.root = toPath(pathText);
+    state.rootText = normalizeSlashes(pathText);
+    state.recursive = recursive;
+    state.interval = interval;
+    state.last = scan(state);
+    return 1;
+}
+
+constexpr NativeFunction kWatcherMethods[] = {
+    {"next", fsWatcherNext, watchNextK},
+    {"poll", fsWatcherPoll},
+    {"close", fsWatcherClose},
+};
+
+constexpr NativeFunction kLockMethods[] = {
+    {"unlock", fsLockUnlock},
+    {"isLocked", fsLockIsLocked},
+};
+
+template <std::size_t N>
+void registerType(lua_State* L, const char* name, const char* typeName, const NativeFunction (&methods)[N]) {
+    if (luaL_newmetatable(L, name)) {
+        lua_createtable(L, 0, static_cast<int>(N));
+        setFunctions(L, methods);
+        lua_setreadonly(L, -1, 1);
+        lua_setfield(L, -2, "__index");
+        lua_pushstring(L, typeName);
+        lua_setfield(L, -2, "__type");
+        lua_pushstring(L, "locked");
+        lua_setfield(L, -2, "__metatable");
+    }
+    lua_pop(L, 1);
+}
+
 constexpr NativeFunction kFunctions[] = {
     {"readFile", fsReadFile},
     {"writeFile", fsWriteFile},
@@ -1460,6 +2425,12 @@ constexpr NativeFunction kFunctions[] = {
     {"makeTempDir", fsMakeTempDir},
     {"chunkPlan", fsChunkPlan},
     {"openReader", fsOpenReader},
+    {"walk", fsWalk},
+    {"glob", fsGlob},
+    {"match", fsMatch},
+    {"watch", fsWatch},
+    {"lock", fsLock},
+    {"tryLock", fsTryLock},
 };
 
 } // namespace
@@ -1476,6 +2447,13 @@ void openFs(lua_State* L) {
     lua_setfield(L, -2, "maxChunkSize");
 
     registerReaderType(L);
+    registerType(L, kWatcherMeta, "fs.Watcher", kWatcherMethods);
+    registerType(L, kLockMeta, "fs.Lock", kLockMethods);
+    if (luaL_newmetatable(L, kWalkerMeta)) {
+        lua_pushstring(L, "locked");
+        lua_setfield(L, -2, "__metatable");
+    }
+    lua_pop(L, 1);
 
     lua_createtable(L, 0, 6);
     setNumberField(L, "file", 0644);

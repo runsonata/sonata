@@ -459,6 +459,35 @@ DataValue DataFile::parse(const std::string& source, const std::string& chunkNam
     return evaluateTable(tableExpr);
 }
 
+std::vector<std::string> DataFile::directives(const std::string& source)
+{
+    Luau::Allocator allocator;
+    Luau::AstNameTable names(allocator);
+    Luau::ParseOptions options;
+
+    const Luau::ParseResult result = Luau::Parser::parse(
+        source.data(),
+        source.size(),
+        names,
+        allocator,
+        options
+    );
+
+    std::vector<std::string> found;
+
+    for (const Luau::HotComment& comment : result.hotcomments)
+    {
+        if (!comment.header)
+            continue;
+
+        // "strict", "nonstrict", "optimize 2", ... -> the first word
+        const std::string& content = comment.content;
+        found.push_back(content.substr(0, content.find_first_of(" \t")));
+    }
+
+    return found;
+}
+
 DataValue DataFile::parseFile(const std::filesystem::path& path)
 {
     std::ifstream file(path, std::ios::binary);

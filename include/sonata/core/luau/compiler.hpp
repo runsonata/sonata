@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -42,12 +44,30 @@ public:
     const std::vector<Byte>& bytes() const noexcept;
     std::vector<Byte>& bytes() noexcept;
 
+    // Luau reports a compile error as "bytecode" that fails to load with the
+    // message (":<line>: <message>"). Returns that message, or std::nullopt
+    // for real bytecode.
+    std::optional<std::string> compileError() const;
+
 private:
     std::vector<Byte> m_bytes;
 };
 
 class Compiler {
 public:
+    // Same defaults as Luau's own (and therefore as "sn run").
+    struct Options {
+        int optimizationLevel = 1; // 0..2; 2 inlines functions, unrolls loops
+        int debugLevel = 1;        // 0..2; 1 = line info for stack traces
+    };
+
+    Compiler() = default;
+    explicit Compiler(Options options);
+
+    // Never throws for bad source; see Bytecode::compileError().
     Bytecode compile(std::string_view source) const;
+
+private:
+    Options options_;
 };
 } // namespace sonata::luau

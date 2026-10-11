@@ -10,6 +10,7 @@
 #include <sonata/core/module.hpp>
 #include <sonata/core/luau/datafile.hpp>
 #include <sonata/core/project.hpp>
+#include <sonata/core/scheduler.hpp>
 #include "lua.h"
 #include "lualib.h"
 
@@ -213,12 +214,11 @@ bool readModule(const ModuleSource& source, const std::string& path, Bytecode& o
     return true;
 }
 
-// Loads "bytecode" into a fresh thread and runs it to completion (or first yield).
+// Loads "bytecode" into a fresh thread, ready to be resumed.
 //
-// The thread is left on top of L's stack, and its results (or the error value)
-// are on the thread's own stack. Returns the lua_resume status; a load failure
-// is reported as LUA_ERRSYNTAX with the message on top of the thread's stack.
-int launch(lua_State* L, const std::string& path, const Bytecode& bytecode, lua_State*& thread) {
+// The thread is left on top of L's stack. Returns false on a load failure, with
+// the message on top of the thread's stack.
+bool prepare(lua_State* L, const std::string& path, const Bytecode& bytecode, lua_State*& thread) {
     // Create the thread from the *main* thread so it doesn't inherit the
     // globals of whoever called require (a sandboxed module thread, say),
     // otherwise modules would see each other's global writes.
@@ -229,10 +229,18 @@ int launch(lua_State* L, const std::string& path, const Bytecode& bytecode, lua_
     luaL_sandboxthread(thread);
 
     const std::string chunkName = "@" + path;
-    if (luau_load(thread, chunkName.c_str(), bytecode.luauData(), bytecode.size(), 0) != 0) {
+    return luau_load(thread, chunkName.c_str(), bytecode.luauData(), bytecode.size(), 0) == 0;
+}
+
+// Loads "bytecode" into a fresh thread and runs it to completion (or first yield).
+//
+// The thread is left on top of L's stack, and its results (or the error value)
+// are on the thread's own stack. Returns the lua_resume status; a load failure
+// is reported as LUA_ERRSYNTAX with the message on top of the thread's stack.
+int launch(lua_State* L, const std::string& path, const Bytecode& bytecode, lua_State*& thread) {
+    if (!prepare(L, path, bytecode, thread)) {
         return LUA_ERRSYNTAX;
     }
-
     return lua_resume(thread, L, 0);
 }
 
@@ -270,18 +278,49 @@ int openLibrary(lua_State* L) {
 
 // require("@sonata/<name>"). Same contract as requireModule(): pushes the
 // value and returns 1, or pushes an error value and returns -1.
-int requireBuiltin(lua_State* L, const lib::LibraryRegistry& libraries, std::string_view request) {
+//
+// "allowed", if set, is the sorted list of libraries scripts may use (see
+// ModuleLoader::restrictLibraries()).
+int requireBuiltin(
+    lua_State* L,
+    const lib::LibraryRegistry& libraries,
+    const std::optional<std::vector<std::string>>& allowed,
+    const std::string& hint,
+    std::string_view request
+) {
     const std::string_view name = builtinName(request);
 
     if (name.empty()) {
         return failWithLocation(L, "require '" + std::string(request) + "' is missing a library name (expected '@sonata/<name>')");
     }
 
+    const auto isAllowed = [&](std::string_view n) {
+        return !allowed || std::binary_search(allowed->begin(), allowed->end(), n);
+    };
+
     const lib::NativeLibrary* library = libraries.find(name);
+
+    // A library Sonata has but this binary was built without (a runtime made
+    // for one program) reads the same as one the program didn't select.
+    const std::vector<std::string>& known = lib::knownLibraryNames();
+    const bool knownButMissing = library == nullptr && allowed &&
+                                 std::binary_search(known.begin(), known.end(), name);
+
+    if ((library != nullptr && !isAllowed(name)) || knownButMissing) {
+        std::string error = "built-in library '" + std::string(request) + "' is not enabled for this program";
+        if (!hint.empty()) {
+            error += " (" + hint + ")";
+        }
+        return failWithLocation(L, error);
+    }
+
     if (library == nullptr) {
         std::string error = "unknown built-in library '" + std::string(request) + "'";
 
-        const std::vector<std::string> available = libraries.names();
+        std::vector<std::string> available = libraries.names();
+        available.erase(std::remove_if(available.begin(), available.end(),
+                                       [&](const std::string& n) { return !isAllowed(n); }),
+                        available.end());
         for (std::size_t i = 0; i < available.size(); ++i) {
             error += (i == 0) ? " (available: " : ", ";
             error += available[i];
@@ -417,6 +456,30 @@ std::optional<std::vector<std::string>> FileSystemSource::dependencyNames(std::s
     }
 }
 
+std::optional<std::string> FileSystemSource::packageEntrypoint(std::string_view directory) const {
+    const std::string manifest = join(std::string(directory), kManifestPath);
+
+    if (!exists(manifest)) {
+        return std::nullopt;
+    }
+
+    // Only the one field is needed, so this deliberately doesn't go through
+    // Project::open() (which would also insist the entrypoint exists).
+    DataValue data;
+    try {
+        data = DataFile::parseFile(fs::path(manifest));
+    } catch (const std::exception& e) {
+        throw ModuleError("could not read the manifest of " + std::string(directory) + ": " + e.what());
+    }
+
+    const DataValue* entrypoint = data.find("entrypoint");
+    if (entrypoint == nullptr || !entrypoint->isString()) {
+        return std::nullopt;
+    }
+
+    return entrypoint->asString();
+}
+
 void MemorySource::add(std::string_view path, Bytecode bytecode) {
     std::string rooted(path);
     if (rooted.empty() || (rooted[0] != '/' && rooted[0] != '\\')) {
@@ -431,7 +494,7 @@ void MemorySource::add(std::string_view path, Bytecode bytecode) {
     files_[std::move(*normalized)] = std::move(bytecode);
 }
 
-void MemorySource::addPackage(std::string_view directory, std::vector<std::string> dependencies) {
+void MemorySource::addPackage(std::string_view directory, std::vector<std::string> dependencies, std::string entrypoint) {
     std::string rooted(directory);
     if (rooted.empty() || (rooted[0] != '/' && rooted[0] != '\\')) {
         rooted.insert(0, "/");
@@ -442,7 +505,7 @@ void MemorySource::addPackage(std::string_view directory, std::vector<std::strin
         throw std::invalid_argument("package directory escapes the root: " + std::string(directory));
     }
 
-    packages_[std::move(*normalized)] = std::move(dependencies);
+    packages_[std::move(*normalized)] = Package{std::move(dependencies), std::move(entrypoint)};
 }
 
 std::optional<std::vector<std::string>> MemorySource::dependencyNames(std::string_view directory) const {
@@ -451,7 +514,16 @@ std::optional<std::vector<std::string>> MemorySource::dependencyNames(std::strin
         return std::nullopt;
     }
 
-    return it->second;
+    return it->second.dependencies;
+}
+
+std::optional<std::string> MemorySource::packageEntrypoint(std::string_view directory) const {
+    auto it = packages_.find(std::string(directory));
+    if (it == packages_.end() || it->second.entrypoint.empty()) {
+        return std::nullopt;
+    }
+
+    return it->second.entrypoint;
 }
 
 bool MemorySource::exists(std::string_view path) const {
@@ -480,6 +552,15 @@ ModuleLoader::ModuleLoader(std::unique_ptr<ModuleSource> source)
 
 void ModuleLoader::addLibrary(lib::NativeLibrary library) {
     libraries_.add(std::move(library));
+}
+
+void ModuleLoader::restrictLibraries(const std::vector<std::string>& allowed, std::string hint) {
+    std::vector<std::string> sorted = allowed;
+    std::sort(sorted.begin(), sorted.end());
+    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+
+    allowedLibraries_ = std::move(sorted);
+    restrictionHint_ = std::move(hint);
 }
 
 void ModuleLoader::addAlias(std::string name, std::string_view directory) {
@@ -535,23 +616,31 @@ void ModuleLoader::run(VM& vm, std::string_view entry) {
     LoadGuard guard(loading_, *path);
 
     lua_State* thread = nullptr;
-    const int status = launch(L, *path, bytecode, thread);
-
-    if (status == LUA_OK) {
+    if (!prepare(L, *path, bytecode, thread)) {
+        std::string message = errorMessage(thread);
         lua_pop(L, 1); // the thread
-        return;
+        throw ModuleError(std::move(message));
     }
 
-    // If you add a scheduler later, this is where yields stop being errors.
-    std::string message = status == LUA_YIELD
-        ? "thread yielded unexpectedly"
-        : errorMessage(thread);
+    // The entry runs as the scheduler's first task, so it can wait (task.wait,
+    // sockets, child processes, ...) while other tasks run. The program lasts
+    // until nothing is left to do, or until the entry fails.
+    sched::Scheduler& scheduler = sched::Scheduler::of(L);
+    scheduler.setCritical(thread);
+    scheduler.resume(thread, L, 0);
+    scheduler.run();
+    scheduler.setCritical(nullptr);
 
-    message += "\nstacktrace:\n";
-    message += lua_debugtrace(thread);
+    std::optional<std::string> failure = scheduler.fatalError();
+    if (!failure && lua_costatus(L, thread) == LUA_COSUS && !scheduler.isWaiting(thread)) {
+        // It used coroutine.yield() at the top level: nothing will ever resume it.
+        failure = std::string("thread yielded unexpectedly\nstacktrace:\n") + lua_debugtrace(thread);
+    }
 
     lua_pop(L, 1); // the thread
-    throw ModuleError(std::move(message));
+    if (failure) {
+        throw ModuleError(std::move(*failure));
+    }
 }
 
 // The function Lua actually calls. It deliberately holds no C++ objects with
@@ -574,7 +663,7 @@ int ModuleLoader::requireCallback(lua_State* L) {
 int ModuleLoader::requireModule(lua_State* L, std::string_view request) {
     // Built-in libraries are checked before anything else, so "@sonata" can't be shadowed.
     if (isBuiltinRequest(request)) {
-        return requireBuiltin(L, libraries_, request);
+        return requireBuiltin(L, libraries_, allowedLibraries_, restrictionHint_, request);
     }
 
     std::string path;
@@ -737,39 +826,38 @@ bool ModuleLoader::resolve(
         return false;
     }
 
-    // Candidates: <base>.luau and <base>/init.luau (or <base>/<entrypoint> from project.luau).
+    // Candidates: <base>.luau and <base>/init.luau. If <base> is a package
+    // whose manifest names an entrypoint (a .luau file that exists), that
+    // file takes init.luau's place.
     const std::string& base = *normalized;
     const bool atRoot = base.back() == '/'; // "/" or "C:/" can't have a ".luau" sibling
 
     const std::string asFile = base + kSourceExtension;
-    
-    // asInit is no longer const so we can overwrite it if sonata/project.luau provides a valid override
     std::string asInit = atRoot ? base + kInitFile : base + "/" + kInitFile;
 
-    // --- ENTRYPOINT LOGIC ---
-    const std::string projectFilePath = atRoot ? base + ".sonata/project.luau" : base + "/.sonata/project.luau";
+    std::optional<std::string> entrypoint;
+    try {
+        auto it = entrypoints_.find(base);
+        if (it == entrypoints_.end()) {
+            it = entrypoints_.emplace(base, source_->packageEntrypoint(base)).first;
+        }
+        entrypoint = it->second;
+    } catch (const std::exception& e) {
+        error = "can't resolve require '" + shown + "': " + e.what();
+        return false;
+    }
 
-    if (source_->exists(projectFilePath)) {
-        DataValue projectData = DataFile::parseFile(std::filesystem::path(projectFilePath));
-        std::string entrypoint = projectData.find("entrypoint") ? projectData.find("entrypoint")->asString() : "";
+    if (entrypoint && endsWith(*entrypoint, kSourceExtension)) {
+        const std::optional<std::string> candidate =
+            normalizePath(atRoot ? base + *entrypoint : base + "/" + *entrypoint);
 
-        if (!entrypoint.empty()) {
-            // Check if the entrypoint ends with the kSourceExtension
-            std::string_view ext(kSourceExtension);
-            bool endsWithExt = entrypoint.size() >= ext.size() && 
-                               entrypoint.compare(entrypoint.size() - ext.size(), ext.size(), ext) == 0;
-
-            if (endsWithExt) {
-                std::string entrypointPath = atRoot ? base + entrypoint : base + "/" + entrypoint;
-
-                // Make sure the file specified actually exists before committing to it
-                if (source_->exists(entrypointPath)) {
-                    asInit = entrypointPath; // Successfully swap kInitFile for the custom entrypoint
-                }
-            }
+        // Make sure the file actually exists (and stays inside the package)
+        // before committing to it.
+        const std::string inside = atRoot ? base : base + "/";
+        if (candidate && startsWith(*candidate, inside) && source_->exists(*candidate)) {
+            asInit = *candidate;
         }
     }
-    // ---------------------------------------
 
     const bool fileExists = !atRoot && source_->exists(asFile);
     const bool initExists = source_->exists(asInit);

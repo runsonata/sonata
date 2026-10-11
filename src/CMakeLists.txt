@@ -4,55 +4,175 @@ include(GNUInstallDirs)
 configure_file(${PROJECT_SOURCE_DIR}/cmake/version.hpp.in
                ${CMAKE_CURRENT_BINARY_DIR}/generated/sonata/version.hpp @ONLY)
 
-add_library(sonata
+# ---- Built-in libraries ----
+# Every library Sonata knows about. Each one lives in core/libs/<name>.cpp and
+# exports libs::open<Name>(). A library that is too big for one file may put
+# the rest of its sources in core/libs/<name>/ (every .cpp there is compiled
+# along with it).
+#
+# SONATA_LIBS picks which of them are compiled in. A normal build has all of
+# them; "sn build" sets it when it builds a runtime tailored to one program.
+# Libraries that aren't picked aren't compiled, and their native dependencies
+# (OpenSSL for net, zstd/libsodium for compress) aren't even looked for.
+set(SONATA_ALL_LIBS
+  fs path sys task process term net json crypto datetime compress regex serde sonata pocket)
+set(SONATA_LIBS "${SONATA_ALL_LIBS}" CACHE STRING
+    "Built-in libraries to compile in (semicolon-separated)")
+
+# "stdio" became part of "term". Build folders configured before that still
+# have it in their cache.
+if("stdio" IN_LIST SONATA_LIBS)
+  list(TRANSFORM SONATA_LIBS REPLACE "^stdio$" "term")
+  list(REMOVE_DUPLICATES SONATA_LIBS)
+  set(SONATA_LIBS "${SONATA_LIBS}" CACHE STRING "Built-in libraries to compile in (semicolon-separated)" FORCE)
+  message(STATUS "sonata: SONATA_LIBS: 'stdio' is now part of 'term'")
+endif()
+
+set(sonata_lib_sources "")
+set(SONATA_LIB_DECLARATIONS "")
+set(SONATA_LIB_REGISTRATIONS "")
+set(SONATA_LIB_NAMES "")
+
+foreach(lib IN LISTS SONATA_ALL_LIBS)
+  string(APPEND SONATA_LIB_NAMES "    \"${lib}\",\n")
+endforeach()
+
+foreach(lib IN LISTS SONATA_LIBS)
+  if(NOT lib IN_LIST SONATA_ALL_LIBS)
+    message(FATAL_ERROR "SONATA_LIBS: unknown library '${lib}' (known: ${SONATA_ALL_LIBS})")
+  endif()
+
+  # "datetime" -> "openDatetime"
+  string(SUBSTRING ${lib} 0 1 first)
+  string(SUBSTRING ${lib} 1 -1 rest)
+  string(TOUPPER ${first} first)
+  set(opener "open${first}${rest}")
+
+  list(APPEND sonata_lib_sources core/libs/${lib}.cpp)
+  file(GLOB lib_extra_sources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/core/libs/${lib}/*.cpp)
+  list(APPEND sonata_lib_sources ${lib_extra_sources})
+  string(APPEND SONATA_LIB_DECLARATIONS "void ${opener}(lua_State* L);\n")
+  string(APPEND SONATA_LIB_REGISTRATIONS "    registry.add({\"${lib}\", libs::${opener}});\n")
+endforeach()
+
+configure_file(${PROJECT_SOURCE_DIR}/cmake/builtin_registry.cpp.in
+               ${CMAKE_CURRENT_BINARY_DIR}/generated/builtin_registry.cpp @ONLY)
+
+set(sonata_sources
   # systems
   core/package.cpp
   core/project.cpp
   core/module.cpp
   core/library.cpp
+  core/system.cpp
+  core/selection.cpp
+  core/pocket.cpp
+  core/bundle.cpp
+  core/runtime.cpp
+  core/scheduler.cpp
   # luau systems
   core/luau/compiler.cpp
   core/luau/datafile.cpp
   core/luau/environment.cpp
   core/luau/vm.cpp
-  # builtin libs
-  #core/libs/example.cpp
-  core/libs/net.cpp
-  core/libs/fs.cpp
-  core/libs/path.cpp
-  core/libs/sys.cpp
-  core/libs/process.cpp
-  core/libs/task.cpp
-  core/libs/stdio.cpp
-  core/libs/json.cpp
-  core/libs/crypto.cpp
-  core/libs/datetime.cpp
-  core/libs/compress.cpp
-  core/libs/serde.cpp
-  core/libs/regex.cpp
-  core/libs/sonata.cpp
+  # builtin libs (see SONATA_LIBS above)
+  ${sonata_lib_sources}
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/builtin_registry.cpp
 )
-add_library(sonata::sonata ALIAS sonata)
 
-target_compile_features(sonata PUBLIC cxx_std_20)
+# ---- Third-party dependencies ----
+# With SONATA_STATIC_DEPS, static copies are tried first and shared ones are the
+# fallback (SONATA_STANDALONE makes the static copy mandatory).
 
-target_include_directories(sonata
-  PUBLIC
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+# A cache entry left over from a configure that found the other kind of
+# library (shared vs static) would stop find_package() from looking again.
+function(sonata_forget_cached_libraries want_static)
+  if(want_static)
+    set(wrong "\\.(so|dylib)(\\.[0-9]+)*$")
+  else()
+    set(wrong "\\.a$")
+  endif()
+  foreach(var IN LISTS ARGN)
+    if(DEFINED CACHE{${var}} AND "$CACHE{${var}}" MATCHES "${wrong}")
+      unset(${var} CACHE)
+    endif()
+  endforeach()
+endfunction()
 
-find_package(OpenSSL REQUIRED)
-target_link_libraries(sonata PUBLIC Luau.Common Luau.VM Luau.Compiler Luau.Ast OpenSSL::SSL OpenSSL::Crypto)
+# Distro static archives usually aren't position-independent, so they can't go
+# into a shared libsonata.
+set(sonata_static_deps ${SONATA_STATIC_DEPS})
+if(BUILD_SHARED_LIBS AND SONATA_STATIC_DEPS)
+  if(SONATA_STANDALONE)
+    message(FATAL_ERROR "SONATA_STANDALONE can't be combined with BUILD_SHARED_LIBS.")
+  endif()
+  message(STATUS "sonata: BUILD_SHARED_LIBS is ON, so OpenSSL and zlib are linked dynamically")
+  set(sonata_static_deps OFF)
+endif()
 
+set(sonata_want_static_zlib OFF)
+if(sonata_static_deps AND UNIX AND NOT APPLE) # macOS's zlib is part of the OS
+  set(sonata_want_static_zlib ON)
+endif()
+
+sonata_forget_cached_libraries(${sonata_want_static_zlib} ZLIB_LIBRARY ZLIB_LIBRARY_RELEASE ZLIB_LIBRARY_DEBUG)
+if(sonata_want_static_zlib)
+  set(ZLIB_USE_STATIC_LIBS ON)
+  find_package(ZLIB QUIET)
+  if(NOT ZLIB_FOUND)
+    if(SONATA_STANDALONE)
+      message(FATAL_ERROR "SONATA_STANDALONE needs a static zlib (libz.a); install it (e.g. zlib1g-dev).")
+    endif()
+    message(STATUS "sonata: no static zlib found, linking it dynamically")
+    set(ZLIB_USE_STATIC_LIBS OFF)
+    unset(ZLIB_LIBRARY CACHE)
+    unset(ZLIB_LIBRARY_RELEASE CACHE)
+    unset(ZLIB_LIBRARY_DEBUG CACHE)
+  endif()
+endif()
 find_package(ZLIB REQUIRED)
-target_link_libraries(sonata PRIVATE ZLIB::ZLIB)
 
-if(SONATA_COMPRESS_ZSTD)
-  set(SONATA_ZSTD_TARGET "")
+set(sonata_openssl_static OFF)
+if("net" IN_LIST SONATA_LIBS)
+  sonata_forget_cached_libraries(${sonata_static_deps} OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
+  if(sonata_static_deps)
+    set(OPENSSL_USE_STATIC_LIBS TRUE)
+    # MSVC: the static OpenSSL build has to match the C runtime, which is
+    # only the static one (/MT) for standalone builds.
+    if(MSVC AND SONATA_STANDALONE)
+      set(OPENSSL_MSVC_STATIC_RT TRUE)
+    endif()
+    find_package(OpenSSL QUIET)
 
+    if(OPENSSL_FOUND)
+      set(sonata_openssl_static ON)
+    else()
+      if(SONATA_STANDALONE)
+        message(FATAL_ERROR "SONATA_STANDALONE needs static OpenSSL libraries (libssl.a/libcrypto.a).")
+      endif()
+      message(STATUS "sonata: no static OpenSSL found, linking it dynamically")
+      set(OPENSSL_USE_STATIC_LIBS FALSE)
+      foreach(var OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY
+                  LIB_EAY_DEBUG LIB_EAY_RELEASE SSL_EAY_DEBUG SSL_EAY_RELEASE
+                  LIB_EAY_LIBRARY_DEBUG LIB_EAY_LIBRARY_RELEASE
+                  SSL_EAY_LIBRARY_DEBUG SSL_EAY_LIBRARY_RELEASE)
+        unset(${var} CACHE)
+      endforeach()
+    endif()
+  endif()
+
+  find_package(OpenSSL REQUIRED)
+  if(sonata_openssl_static)
+    message(STATUS "sonata: OpenSSL linked statically")
+  endif()
+endif()
+
+set(SONATA_ZSTD_TARGET "")
+set(SONATA_SODIUM_TARGET "")
+
+if(SONATA_COMPRESS_ZSTD AND "compress" IN_LIST SONATA_LIBS)
   find_package(zstd CONFIG QUIET)
-  foreach(t zstd::libzstd zstd::libzstd_static zstd::libzstd_shared)
+  foreach(t zstd::libzstd_static zstd::libzstd zstd::libzstd_shared)
     if(NOT SONATA_ZSTD_TARGET AND TARGET ${t})
       set(SONATA_ZSTD_TARGET ${t})
     endif()
@@ -61,6 +181,9 @@ if(SONATA_COMPRESS_ZSTD)
   if(NOT SONATA_ZSTD_TARGET)
     find_package(PkgConfig QUIET)
     if(PKG_CONFIG_FOUND)
+      if(sonata_static_deps)
+        set(PKG_CONFIG_USE_STATIC_LIBS ON)
+      endif()
       pkg_check_modules(SONATA_ZSTD_PC QUIET IMPORTED_TARGET libzstd)
       if(SONATA_ZSTD_PC_FOUND)
         set(SONATA_ZSTD_TARGET PkgConfig::SONATA_ZSTD_PC)
@@ -74,15 +197,10 @@ if(SONATA_COMPRESS_ZSTD)
       "(libzstd-dev / brew install zstd / vcpkg install zstd), point "
       "CMAKE_PREFIX_PATH at it, or configure with -DSONATA_COMPRESS_ZSTD=OFF.")
   endif()
-
-  target_link_libraries(sonata PRIVATE ${SONATA_ZSTD_TARGET})
-  target_compile_definitions(sonata PUBLIC SONATA_COMPRESS_ZSTD)
   message(STATUS "sonata: compress: zstd enabled (${SONATA_ZSTD_TARGET})")
 endif()
 
-if(SONATA_COMPRESS_CRYPTO)
-  set(SONATA_SODIUM_TARGET "")
-
+if(SONATA_COMPRESS_CRYPTO AND "compress" IN_LIST SONATA_LIBS)
   find_package(unofficial-sodium CONFIG QUIET)
   if(TARGET unofficial-sodium::sodium)
     set(SONATA_SODIUM_TARGET unofficial-sodium::sodium)
@@ -91,6 +209,9 @@ if(SONATA_COMPRESS_CRYPTO)
   if(NOT SONATA_SODIUM_TARGET)
     find_package(PkgConfig QUIET)
     if(PKG_CONFIG_FOUND)
+      if(sonata_static_deps)
+        set(PKG_CONFIG_USE_STATIC_LIBS ON)
+      endif()
       pkg_check_modules(SONATA_SODIUM_PC QUIET IMPORTED_TARGET libsodium)
       if(SONATA_SODIUM_PC_FOUND)
         set(SONATA_SODIUM_TARGET PkgConfig::SONATA_SODIUM_PC)
@@ -120,9 +241,6 @@ if(SONATA_COMPRESS_CRYPTO)
       "(libsodium-dev / brew install libsodium / vcpkg install libsodium), "
       "point CMAKE_PREFIX_PATH at it, or configure with -DSONATA_COMPRESS_CRYPTO=OFF.")
   endif()
-
-  target_link_libraries(sonata PRIVATE ${SONATA_SODIUM_TARGET})
-  target_compile_definitions(sonata PUBLIC SONATA_COMPRESS_CRYPTO)
   message(STATUS "sonata: compress: password support enabled (${SONATA_SODIUM_TARGET})")
 endif()
 
@@ -160,14 +278,63 @@ foreach(part MAJOR MINOR PATCH)
   endif()
 endforeach()
 
-if(WIN32)
-  target_link_libraries(sonata PRIVATE ws2_32)
+# ---- The library ----
+function(sonata_setup_library target)
+  target_compile_features(${target} PUBLIC cxx_std_20)
+
+  target_include_directories(${target}
+    PUBLIC
+      $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>
+      $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/core)
+
+  target_link_libraries(${target} PUBLIC Luau.Common Luau.VM Luau.Compiler Luau.Ast)
+  target_link_libraries(${target} PRIVATE ZLIB::ZLIB)
+
+  if("net" IN_LIST SONATA_LIBS)
+    target_link_libraries(${target} PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    if(WIN32 AND sonata_openssl_static)
+      target_link_libraries(${target} PUBLIC crypt32 ws2_32 user32 advapi32)
+    endif()
+    if(WIN32)
+      target_link_libraries(${target} PRIVATE iphlpapi) # net.interfaces, DNS server list
+    endif()
+  endif()
+
+  if(SONATA_ZSTD_TARGET)
+    target_link_libraries(${target} PRIVATE ${SONATA_ZSTD_TARGET})
+    target_compile_definitions(${target} PUBLIC SONATA_COMPRESS_ZSTD)
+  endif()
+
+  if(SONATA_SODIUM_TARGET)
+    target_link_libraries(${target} PRIVATE ${SONATA_SODIUM_TARGET})
+    target_compile_definitions(${target} PUBLIC SONATA_COMPRESS_CRYPTO)
+  endif()
+
+  if(WIN32)
+    target_link_libraries(${target} PRIVATE ws2_32)
+  endif()
+
+  # PUBLIC so the CLI and installed consumers see the same values as the
+  # library (info.hpp is all inline constexpr).
+  target_compile_definitions(${target} PUBLIC ${sonata_info_defs})
+endfunction()
+
+add_library(sonata ${sonata_sources})
+sonata_setup_library(sonata)
+add_library(sonata::sonata ALIAS sonata)
+
+# The runtime must never need libsonata.so next to it, so with
+# BUILD_SHARED_LIBS it links a static copy of the library instead.
+if(SONATA_BUILD_RUNTIME AND BUILD_SHARED_LIBS)
+  add_library(sonata_static STATIC ${sonata_sources})
+  sonata_setup_library(sonata_static)
+  add_library(sonata::runtime ALIAS sonata_static)
+else()
+  add_library(sonata::runtime ALIAS sonata)
 endif()
-
-
-# PUBLIC so the CLI and installed consumers see the same values as the
-# library (info.hpp is all inline constexpr).
-target_compile_definitions(sonata PUBLIC ${sonata_info_defs})
 
 if(SONATA_INSTALL AND SONATA_OWNS_LUAU)
   include(CMakePackageConfigHelpers)
@@ -196,7 +363,8 @@ if(SONATA_INSTALL AND SONATA_OWNS_LUAU)
 
   install(TARGETS sonata ${SONATA_LUAU_TARGETS} EXPORT sonataTargets)
   install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-  install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+          FILES_MATCHING PATTERN "*.hpp")
   install(EXPORT sonataTargets NAMESPACE sonata:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/sonata)
 
   configure_package_config_file(${PROJECT_SOURCE_DIR}/cmake/sonataConfig.cmake.in

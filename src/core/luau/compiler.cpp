@@ -102,9 +102,24 @@ std::vector<Bytecode::Byte>& Bytecode::bytes() noexcept {
     return m_bytes;
 }
 
+std::optional<std::string> Bytecode::compileError() const
+{
+    if (m_bytes.empty() || m_bytes[0] != 0)
+        return std::nullopt;
+
+    return std::string(luauData() + 1, m_bytes.size() - 1);
+}
+
+Compiler::Compiler(Options options)
+    : options_(options)
+{
+}
+
 Bytecode Compiler::compile(std::string_view source) const
 {
     Luau::CompileOptions coptions;
+    coptions.optimizationLevel = options_.optimizationLevel;
+    coptions.debugLevel = options_.debugLevel;
     Luau::ParseOptions poptions;
     //source, CompileOptions, ParseOptions
     std::string bytecode = Luau::compile(

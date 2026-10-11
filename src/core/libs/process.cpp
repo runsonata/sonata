@@ -1,22 +1,23 @@
-// @sonata/process: facts about the running process, and ways to act on it.
+// @sonata/process: the running program, the child processes it starts, and signals.
+// Facts about the machine itself (OS, CPU, memory, ...) are in @sonata/sys.
 //
 //     local process = require("@sonata/process")
 //
-//     process.os            --> "windows" | "macos" | "linux" | "freebsd" | "android" | "unknown"
-//     process.arch          --> "x86_64" | "aarch64" | "x86" | "arm" | "riscv64" | "unknown"
-//     process.endianness    --> "little" | "big"
+// The running program
 //     process.pid           --> 4242
-//     process.execPath      --> "/usr/local/bin/sonata"        (nil if it cannot be determined)
-//     process.args          --> { "build", "--release" }        (set by the host via process::setArguments)
-//
-//     process.cwd()                  --> "/home/me/project"
-//     process.chdir("/tmp")
-//     process.exit(code)             -- never returns; code defaults to 0
-//
-//     process.env.HOME               --> "/home/me"             (nil if unset)
-//     process.env.FOO = "bar"        -- assigning nil removes the variable
+//     process.ppid          --> 4200                            (nil if it cannot be determined)
+//     process.execPath      --> "/usr/local/bin/sn"             (nil if it cannot be determined)
+//     process.args          --> { "build", "--release" }        the program's arguments
+//     process.env.HOME      --> "/home/me"                      (nil if unset)
+//     process.env.FOO = "bar"                                   assigning nil removes the variable
 //     for name, value in process.env do ... end
+//     process.cwd()         --> "/home/me/project"
+//     process.chdir("/tmp")
+//     process.uptime()      --> seconds since the program started
+//     process.memoryUsage() --> { rss: number?, luauHeap: number }   bytes in RAM / used by this VM's heap
+//     process.exit(code?)   never returns; code defaults to 0
 //
+// Running a program and collecting its output
 //     local result = process.exec("git", { "status", "--short" }, {
 //         cwd = "repo",                -- working directory of the child
 //         env = { GIT_PAGER = "cat" }, -- added to / overriding the inherited environment
@@ -26,24 +27,72 @@
 //     })
 //     result.ok, result.code, result.stdout, result.stderr
 //
+// Starting a program and talking to it while it runs
+//     local child = process.spawn("python3", { "-i" }, {
+//         cwd, env, shell,             -- as for exec
+//         stdin = "pipe",              -- each of stdin/stdout/stderr: "pipe" (default) | "inherit" | "null"
+//         stdout = "pipe",
+//         stderr = "inherit",
+//         stdio = "pipe",              -- sets all three at once (the individual options win)
+//         detached = false,            -- true: own session / process group, survives our Ctrl+C
+//     })
+//     child.pid
+//     child.stdin:write(data)      --> true | nil, err      child.stdin:close()   (sends EOF)
+//     child.stdout:read(max?)      --> string?              whatever is available (up to max, default 64 KiB);
+//                                                           nil at EOF
+//     child.stdout:readLine(keepEnding?) --> string?        nil at EOF
+//     child.stdout:readAll()       --> string               everything until EOF
+//     child.stderr: the same
+//     child:wait(timeout?)         --> { ok, code, signal? } | nil, "timed out"
+//     child:status()               --> nil while it runs, the same table as wait() once it has exited
+//     child:kill(signal?)          --> boolean             signal defaults to "terminate"
+//
+//   Pipes exist only for streams set to "pipe". A pipe read waits for data without
+//   blocking other tasks; reading from two tasks at once is safe (they take turns).
+//   A child that is never waited for is reaped in the background.
+//
+// Signals
+//     process.kill(pid, signal?)   --> true | nil, err      signal defaults to "terminate"
+//     process.onSignal(signal, handler?)                    handler(signalName) runs as a new task each
+//                                                           time the signal arrives; nil restores the
+//                                                           default behaviour (usually: exit)
+//
+//   Signal names: "interrupt" (Ctrl+C), "terminate", "hangup", "quit", "user1", "user2",
+//   "resize" (terminal resized), "alarm", "continue", plus "kill" and "stop" for sending.
+//   "SIGINT", "INT" and plain numbers work too. On Windows only "interrupt", "break"
+//   (Ctrl+Break) and "hangup" (console closed) can be handled, and sending any signal
+//   terminates the process.
+//   A handler does not keep the program alive by itself.
+//
 // Notes:
-//   * process.exec blocks the whole VM until the child exits, so other tasks do not run meanwhile.
-//     A program that cannot be started raises an error; one that exits non-zero does not (ok = false).
-//   * A child killed by a signal reports code 128 + signal, like a shell would.
+//   * exec, wait, and pipe reads and writes let other tasks run while they wait
+//     (see @sonata/task). A program that cannot be started raises an error; one
+//     that exits non-zero does not (ok = false).
+//   * A child killed by a signal reports code 128 + signal, like a shell would,
+//     and wait() also names the signal.
 //   * With stdio = "inherit" the child shares the terminal and result.stdout / result.stderr are "".
 //   * process.exit uses std::exit: stdio is flushed and atexit handlers run, but stack objects of
 //     the host are not unwound. Register cleanup with std::atexit if it must always happen.
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <functional>
 #include <iterator>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -55,8 +104,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <algorithm>
-#include <thread>
+#include <tlhelp32.h>
+#ifndef PSAPI_VERSION
+#define PSAPI_VERSION 2 // GetProcessMemoryInfo from kernel32, no psapi.lib needed
+#endif
+#include <psapi.h>
 #else
 #include <fcntl.h>
 #include <poll.h>
@@ -68,27 +120,16 @@
 #if defined(__APPLE__)
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
 #endif
 #endif
 
 #include <sonata/core/library.hpp>
+#include <sonata/core/scheduler.hpp>
 #include "lua.h"
 #include "lualib.h"
 
 #include "libs.hpp"
-
-// host API ///////////////
-//
-// Host-side configuration for @sonata/process.
-namespace sonata::lib::libs::process {
-
-// Sets what scripts see as "process.args", e.g. the command-line arguments that
-// follow the script path. Call it before the script first requires
-// "@sonata/process": the library reads the list once, when it is opened. If it
-// is never called, "process.args" is an empty table.
-void setArguments(lua_State* L, const std::vector<std::string>& args);
-
-} // namespace sonata::lib::libs::process
 
 #if !defined(_WIN32) && !defined(__APPLE__)
 extern char** environ;
@@ -98,6 +139,7 @@ namespace sonata::lib::libs {
 
 namespace {
 
+// The runtime stores the program's arguments here (see sonata/core/runtime.cpp).
 constexpr const char* kArgsRegistryKey = "sonata.process.args";
 
 // platform layer /////////////
@@ -112,45 +154,6 @@ using EnvList = std::vector<std::pair<std::string, std::string>>;
 
 std::string errorText(int code) {
     return std::system_category().message(code);
-}
-
-const char* osName() {
-#if defined(_WIN32)
-    return "windows";
-#elif defined(__APPLE__)
-    return "macos";
-#elif defined(__ANDROID__)
-    return "android";
-#elif defined(__linux__)
-    return "linux";
-#elif defined(__FreeBSD__)
-    return "freebsd";
-#else
-    return "unknown";
-#endif
-}
-
-const char* archName() {
-#if defined(__x86_64__) || defined(_M_X64)
-    return "x86_64";
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    return "aarch64";
-#elif defined(__i386__) || defined(_M_IX86)
-    return "x86";
-#elif defined(__arm__) || defined(_M_ARM)
-    return "arm";
-#elif defined(__riscv) && __riscv_xlen == 64
-    return "riscv64";
-#else
-    return "unknown";
-#endif
-}
-
-const char* endiannessName() {
-    const std::uint16_t probe = 1;
-    unsigned char first = 0;
-    std::memcpy(&first, &probe, 1);
-    return first == 1 ? "little" : "big";
 }
 
 #if defined(_WIN32)
@@ -424,6 +427,7 @@ struct ExecSpec {
     std::vector<std::string> args;
     std::optional<std::string> cwd;
     EnvList env;                 // added to / overriding the inherited environment
+    EnvList baseEnv;             // POSIX: the environment "env" applies to, read on the VM's thread
     std::string stdinData;
     bool hasStdin = false;
     bool shell = false;
@@ -454,6 +458,11 @@ public:
             CloseHandle(handle_);
         }
         handle_ = handle;
+    }
+    HANDLE release() {
+        HANDLE handle = handle_;
+        handle_ = nullptr;
+        return handle;
     }
 
 private:
@@ -675,6 +684,11 @@ public:
         }
         fd_ = fd;
     }
+    int release() {
+        const int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
 
 private:
     int fd_ = -1;
@@ -859,8 +873,7 @@ ExecOutcome runExec(const ExecSpec& spec) {
     std::vector<char*> envp;
     const bool customEnv = !spec.env.empty();
     if (customEnv) {
-        EnvList merged;
-        listEnv(merged);
+        EnvList merged = spec.baseEnv;
 
         for (const auto& [name, value] : spec.env) {
             bool replaced = false;
@@ -970,6 +983,640 @@ ExecOutcome runExec(const ExecSpec& spec) {
 }
 
 #endif // _WIN32
+
+
+// child processes that keep running ////////
+//
+// Everything below runs either on the VM's thread (spawning, killing, polling)
+// or on scheduler worker threads (reading, writing, waiting); never in Lua.
+
+enum class StdioMode { Pipe, Inherit, Null };
+
+struct SpawnSpec {
+    ExecSpec exec; // program, args, cwd, env, baseEnv, shell
+    StdioMode modes[3] = {StdioMode::Pipe, StdioMode::Pipe, StdioMode::Pipe};
+    bool detached = false;
+};
+
+// Our end of a pipe to a child. Shared with the worker jobs that use it, so it
+// stays valid while one of them is blocked in a read or write.
+struct PipeEnd {
+#if defined(_WIN32)
+    HANDLE handle = nullptr;
+#else
+    int fd = -1;
+#endif
+    std::mutex ioMutex;  // one read or write job at a time (held for the whole job)
+    std::mutex mutex;    // guards everything below
+    std::string buffer;  // read side: received but not consumed yet
+    bool eof = false;
+    std::string error;   // read side: why reading stopped early
+    bool closed = false; // close() was called
+    int busy = 0;        // jobs using the descriptor right now
+
+    PipeEnd() = default;
+    PipeEnd(const PipeEnd&) = delete;
+    PipeEnd& operator=(const PipeEnd&) = delete;
+    ~PipeEnd() { release(); }
+
+    // Closes the descriptor. Only when nobody uses it (busy == 0).
+    void release() {
+#if defined(_WIN32)
+        if (handle != nullptr) {
+            CloseHandle(handle);
+            handle = nullptr;
+        }
+#else
+        if (fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
+#endif
+    }
+
+    // close() from the VM's thread: now if possible, otherwise as soon as the job using it is done.
+    void close() {
+        std::lock_guard<std::mutex> lock(mutex);
+        closed = true;
+        if (busy == 0) {
+            release();
+        }
+    }
+};
+
+using PipePtr = std::shared_ptr<PipeEnd>;
+
+// One read straight from the OS. Bytes read, 0 at EOF, -1 on failure (error set).
+long long osRead(PipeEnd& p, char* destination, std::size_t size, std::string& error) {
+#if defined(_WIN32)
+    DWORD got = 0;
+    if (ReadFile(p.handle, destination, static_cast<DWORD>(std::min<std::size_t>(size, 1u << 30)), &got, nullptr)) {
+        return got;
+    }
+    const DWORD code = GetLastError();
+    if (code == ERROR_BROKEN_PIPE || code == ERROR_HANDLE_EOF) {
+        return 0;
+    }
+    error = errorText(static_cast<int>(code));
+    return -1;
+#else
+    for (;;) {
+        const ssize_t got = ::read(p.fd, destination, size);
+        if (got >= 0) {
+            return got;
+        }
+        if (errno != EINTR) {
+            error = errorText(errno);
+            return -1;
+        }
+    }
+#endif
+}
+
+// Worker side of a read: reads until "enough" is true of the buffer, or EOF.
+void fillUntil(PipeEnd& p, const std::function<bool(const std::string&)>& enough) {
+    std::lock_guard<std::mutex> io(p.ioMutex);
+    {
+        std::lock_guard<std::mutex> lock(p.mutex);
+        if (p.closed || p.eof || enough(p.buffer)) {
+            return;
+        }
+        ++p.busy;
+    }
+
+    std::vector<char> chunk(64 * 1024);
+    for (;;) {
+        std::string error;
+        const long long got = osRead(p, chunk.data(), chunk.size(), error);
+
+        std::lock_guard<std::mutex> lock(p.mutex);
+        if (got > 0) {
+            p.buffer.append(chunk.data(), static_cast<std::size_t>(got));
+        } else {
+            p.eof = true;
+            p.error = error;
+        }
+        if (p.eof || p.closed || enough(p.buffer)) {
+            if (--p.busy == 0 && p.closed) {
+                p.release();
+            }
+            return;
+        }
+    }
+}
+
+// Worker side of a write. Returns an error message, or "" once everything is written.
+std::string writeTo(PipeEnd& p, const std::string& data) {
+    std::lock_guard<std::mutex> io(p.ioMutex);
+    {
+        std::lock_guard<std::mutex> lock(p.mutex);
+        if (p.closed) {
+            return "the pipe is closed";
+        }
+        ++p.busy;
+    }
+
+    std::string error;
+    std::size_t written = 0;
+#if defined(_WIN32)
+    while (written < data.size()) {
+        DWORD chunk = 0;
+        const DWORD want = static_cast<DWORD>(std::min<std::size_t>(data.size() - written, 1u << 20));
+        if (!WriteFile(p.handle, data.data() + written, want, &chunk, nullptr)) {
+            error = errorText(static_cast<int>(GetLastError()));
+            break;
+        }
+        written += chunk;
+    }
+#else
+    {
+        SigpipeBlocker blocker; // a child that stopped reading must not kill us
+        while (written < data.size()) {
+            const ssize_t n = ::write(p.fd, data.data() + written, data.size() - written);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                error = errorText(errno);
+                break;
+            }
+            written += static_cast<std::size_t>(n);
+        }
+    }
+#endif
+
+    std::lock_guard<std::mutex> lock(p.mutex);
+    if (--p.busy == 0 && p.closed) {
+        p.release();
+    }
+    return error;
+}
+
+struct ChildState {
+    std::mutex mutex;
+#if defined(_WIN32)
+    HANDLE process = nullptr;
+    DWORD pid = 0;
+#else
+    pid_t pid = -1;
+#endif
+    bool exited = false;
+    int code = 0;
+    int signal = 0; // POSIX: the signal that killed it, 0 if none
+
+    ChildState() = default;
+    ChildState(const ChildState&) = delete;
+    ChildState& operator=(const ChildState&) = delete;
+
+    ~ChildState() {
+#if defined(_WIN32)
+        if (process != nullptr) {
+            CloseHandle(process);
+        }
+#else
+        if (!exited && pid > 0) {
+            // Nobody waited for it: reap it in the background so it does not stay a zombie.
+            const pid_t child = pid;
+            std::thread([child] {
+                int status = 0;
+                while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+                }
+            }).detach();
+        }
+#endif
+    }
+};
+
+using ChildPtr = std::shared_ptr<ChildState>;
+
+// Has it exited? Checks without waiting. Caller holds child.mutex.
+bool pollExit(ChildState& child) {
+    if (child.exited) {
+        return true;
+    }
+#if defined(_WIN32)
+    if (WaitForSingleObject(child.process, 0) != WAIT_OBJECT_0) {
+        return false;
+    }
+    DWORD code = 0;
+    GetExitCodeProcess(child.process, &code);
+    child.code = static_cast<int>(code);
+    child.exited = true;
+#else
+    int status = 0;
+    const pid_t result = ::waitpid(child.pid, &status, WNOHANG);
+    if (result == 0 || (result < 0 && errno == EINTR)) {
+        return false;
+    }
+    child.exited = true;
+    if (result < 0) {
+        child.code = -1; // someone else reaped it
+    } else if (WIFEXITED(status)) {
+        child.code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        child.signal = WTERMSIG(status);
+        child.code = 128 + child.signal;
+    } else {
+        child.code = -1;
+    }
+#endif
+    return true;
+}
+
+// Worker side of wait(): true once it has exited, false if "timeout" seconds passed first.
+bool waitExit(ChildState& child, double timeout) {
+#if defined(_WIN32)
+    const DWORD ms = timeout >= static_cast<double>(INFINITE) / 1000.0 ? INFINITE : static_cast<DWORD>(std::ceil(timeout * 1000.0));
+    WaitForSingleObject(child.process, ms);
+    std::lock_guard<std::mutex> lock(child.mutex);
+    return pollExit(child);
+#else
+    // waitpid() has no timeout, and a blocking one would hold the lock: poll with a backoff.
+    const auto start = std::chrono::steady_clock::now();
+    auto pause = std::chrono::milliseconds(1);
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lock(child.mutex);
+            if (pollExit(child)) {
+                return true;
+            }
+        }
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeout) {
+            return false;
+        }
+        const auto left = std::chrono::duration<double>(timeout - elapsed);
+        std::this_thread::sleep_for(left < pause ? std::chrono::duration_cast<std::chrono::milliseconds>(left) : pause);
+        pause = std::min(pause * 2, std::chrono::milliseconds(50));
+    }
+#endif
+}
+
+bool killChild(ChildState& child, int signal, std::string& error) {
+    std::lock_guard<std::mutex> lock(child.mutex);
+    if (pollExit(child)) {
+        error = "the process has already exited";
+        return false;
+    }
+#if defined(_WIN32)
+    (void)signal;
+    if (!TerminateProcess(child.process, 1)) {
+        error = errorText(static_cast<int>(GetLastError()));
+        return false;
+    }
+#else
+    if (::kill(child.pid, signal) != 0) {
+        error = errorText(errno);
+        return false;
+    }
+#endif
+    return true;
+}
+
+struct Spawned {
+    ChildPtr child;
+    PipePtr pipes[3];
+    std::string error; // why it could not be started
+};
+
+#if defined(_WIN32)
+
+Spawned spawnChild(const SpawnSpec& spec) {
+    Spawned out;
+    const ExecSpec& exec = spec.exec;
+    std::fflush(nullptr);
+
+    std::wstring commandLine;
+    if (exec.shell) {
+        std::string command = exec.program;
+        for (const std::string& arg : exec.args) {
+            command += ' ';
+            command += arg;
+        }
+        std::string comspec = "cmd.exe";
+        std::string fromEnv;
+        if (getEnv("ComSpec", fromEnv) && !fromEnv.empty()) {
+            comspec = fromEnv;
+        }
+        commandLine = quoteArgument(widen(comspec)) + L" /d /s /c \"" + widen(command) + L"\"";
+    } else {
+        commandLine = quoteArgument(widen(exec.program));
+        for (const std::string& arg : exec.args) {
+            commandLine += L' ';
+            commandLine += quoteArgument(widen(arg));
+        }
+    }
+
+    std::wstring environmentBlock;
+    if (!exec.env.empty()) {
+        WideEnvList merged = currentEnvironmentWide();
+        for (const auto& [name, value] : exec.env) {
+            const std::wstring wideName = widen(name);
+            bool replaced = false;
+            for (auto& existing : merged) {
+                if (sameName(existing.first, wideName)) {
+                    existing.second = widen(value);
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                merged.emplace_back(wideName, widen(value));
+            }
+        }
+        std::sort(merged.begin(), merged.end(), [](const auto& a, const auto& b) {
+            return CompareStringOrdinal(a.first.c_str(), -1, b.first.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+        });
+        for (const auto& [name, value] : merged) {
+            environmentBlock += name;
+            environmentBlock += L'=';
+            environmentBlock += value;
+            environmentBlock += L'\0';
+        }
+        environmentBlock += L'\0';
+    }
+
+    const std::wstring workingDir = exec.cwd ? widen(*exec.cwd) : std::wstring();
+
+    Handle parentEnds[3], childEnds[3];
+    const DWORD stdIds[3] = {STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE};
+    HANDLE given[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        switch (spec.modes[i]) {
+        case StdioMode::Pipe:
+            if (!makePipe(parentEnds[i], childEnds[i], i == 0)) {
+                out.error = "failed to create pipes: " + errorText(static_cast<int>(GetLastError()));
+                return out;
+            }
+            given[i] = childEnds[i].get();
+            break;
+        case StdioMode::Null: {
+            SECURITY_ATTRIBUTES attributes{};
+            attributes.nLength = sizeof(attributes);
+            attributes.bInheritHandle = TRUE;
+            childEnds[i].reset(CreateFileW(L"NUL", i == 0 ? GENERIC_READ : GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                           &attributes, OPEN_EXISTING, 0, nullptr));
+            if (!childEnds[i].valid()) {
+                out.error = "failed to open the null device: " + errorText(static_cast<int>(GetLastError()));
+                return out;
+            }
+            given[i] = childEnds[i].get();
+            break;
+        }
+        case StdioMode::Inherit:
+            given[i] = GetStdHandle(stdIds[i]);
+            break;
+        }
+    }
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = given[0];
+    startup.hStdOutput = given[1];
+    startup.hStdError = given[2];
+
+    DWORD flags = CREATE_UNICODE_ENVIRONMENT;
+    if (spec.detached) {
+        flags |= DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    }
+
+    PROCESS_INFORMATION info{};
+    if (!CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, TRUE, flags,
+                        exec.env.empty() ? nullptr : environmentBlock.data(),
+                        workingDir.empty() ? nullptr : workingDir.c_str(), &startup, &info)) {
+        out.error = "failed to run '" + exec.program + "': " + errorText(static_cast<int>(GetLastError()));
+        return out;
+    }
+    CloseHandle(info.hThread);
+
+    out.child = std::make_shared<ChildState>();
+    out.child->process = info.hProcess;
+    out.child->pid = info.dwProcessId;
+    for (int i = 0; i < 3; ++i) {
+        if (parentEnds[i].valid()) {
+            out.pipes[i] = std::make_shared<PipeEnd>();
+            out.pipes[i]->handle = parentEnds[i].release();
+        }
+    }
+    return out;
+}
+
+#else // POSIX
+
+Spawned spawnChild(const SpawnSpec& spec) {
+    Spawned out;
+    const ExecSpec& exec = spec.exec;
+    std::fflush(nullptr);
+
+    // Everything the child needs is prepared here: after fork() it may not allocate.
+    std::vector<std::string> words;
+    if (exec.shell) {
+        std::string command = exec.program;
+        for (const std::string& arg : exec.args) {
+            command += ' ';
+            command += arg;
+        }
+        words = {"/bin/sh", "-c", std::move(command)};
+    } else {
+        words.push_back(exec.program);
+        words.insert(words.end(), exec.args.begin(), exec.args.end());
+    }
+    std::vector<char*> argv;
+    for (std::string& word : words) {
+        argv.push_back(word.data());
+    }
+    argv.push_back(nullptr);
+
+    std::vector<std::string> environment;
+    std::vector<char*> envp;
+    const bool customEnv = !exec.env.empty();
+    if (customEnv) {
+        EnvList merged = exec.baseEnv;
+        for (const auto& [name, value] : exec.env) {
+            const auto it = std::find_if(merged.begin(), merged.end(), [&](const auto& e) { return e.first == name; });
+            if (it != merged.end()) {
+                it->second = value;
+            } else {
+                merged.emplace_back(name, value);
+            }
+        }
+        for (const auto& [name, value] : merged) {
+            environment.push_back(name + "=" + value);
+        }
+        for (std::string& entry : environment) {
+            envp.push_back(entry.data());
+        }
+        envp.push_back(nullptr);
+    }
+    const char* cwd = exec.cwd ? exec.cwd->c_str() : nullptr;
+
+    Fd parentEnds[3], childEnds[3], failRead, failWrite;
+    for (int i = 0; i < 3; ++i) {
+        if (spec.modes[i] == StdioMode::Pipe) {
+            Fd readEnd, writeEnd;
+            if (!makePipe(readEnd, writeEnd)) {
+                out.error = "failed to create pipes: " + errorText(errno);
+                return out;
+            }
+            childEnds[i].reset(i == 0 ? readEnd.release() : writeEnd.release());
+            parentEnds[i].reset(i == 0 ? writeEnd.release() : readEnd.release());
+        } else if (spec.modes[i] == StdioMode::Null) {
+            childEnds[i].reset(::open("/dev/null", i == 0 ? O_RDONLY : O_WRONLY));
+            if (!secureFd(childEnds[i])) {
+                out.error = "failed to open /dev/null: " + errorText(errno);
+                return out;
+            }
+        }
+    }
+    if (!makePipe(failRead, failWrite)) {
+        out.error = "failed to create pipes: " + errorText(errno);
+        return out;
+    }
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        out.error = "failed to fork: " + errorText(errno);
+        return out;
+    }
+
+    if (pid == 0) {
+        // Child. Only async-signal-safe calls from here until exec; it never returns.
+        if (spec.detached) {
+            ::setsid();
+        }
+        for (int i = 0; i < 3; ++i) {
+            if (childEnds[i].valid() && ::dup2(childEnds[i].get(), i) < 0) {
+                childFail(failWrite.get(), 0, errno);
+            }
+        }
+        if (cwd && ::chdir(cwd) != 0) {
+            childFail(failWrite.get(), 1, errno);
+        }
+        if (customEnv) {
+            setEnvironBlock(envp.data());
+        }
+        ::execvp(argv[0], argv.data());
+        childFail(failWrite.get(), 2, errno);
+    }
+
+    for (Fd& end : childEnds) {
+        end.reset();
+    }
+    failWrite.reset();
+
+    ChildFailure failure{0, 0};
+    ssize_t got;
+    do {
+        got = ::read(failRead.get(), &failure, sizeof(failure));
+    } while (got < 0 && errno == EINTR);
+    failRead.reset();
+
+    if (got == static_cast<ssize_t>(sizeof(failure))) {
+        reap(pid);
+        if (failure.stage == 1) {
+            out.error = "failed to change directory to '" + *exec.cwd + "': " + errorText(failure.error);
+        } else if (failure.stage == 2) {
+            out.error = "failed to run '" + exec.program + "': " + errorText(failure.error);
+        } else {
+            out.error = "failed to set up the child's stdio: " + errorText(failure.error);
+        }
+        return out;
+    }
+
+    out.child = std::make_shared<ChildState>();
+    out.child->pid = pid;
+    for (int i = 0; i < 3; ++i) {
+        if (parentEnds[i].valid()) {
+            out.pipes[i] = std::make_shared<PipeEnd>();
+            out.pipes[i]->fd = parentEnds[i].release();
+        }
+    }
+    return out;
+}
+
+#endif // _WIN32
+
+// the running process ////////
+
+std::optional<double> parentProcessId() {
+#if defined(_WIN32)
+    const DWORD self = GetCurrentProcessId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+    std::optional<double> parent;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL ok = Process32FirstW(snapshot, &entry); ok; ok = Process32NextW(snapshot, &entry)) {
+        if (entry.th32ProcessID == self) {
+            parent = static_cast<double>(entry.th32ParentProcessID);
+            break;
+        }
+    }
+    CloseHandle(snapshot);
+    return parent;
+#else
+    return static_cast<double>(::getppid());
+#endif
+}
+
+// Resident set size in bytes.
+std::optional<double> residentMemory() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        return std::nullopt;
+    }
+    return static_cast<double>(counters.WorkingSetSize);
+#elif defined(__APPLE__)
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+        return std::nullopt;
+    }
+    return static_cast<double>(info.resident_size);
+#elif defined(__linux__)
+    std::FILE* file = std::fopen("/proc/self/statm", "r");
+    if (!file) {
+        return std::nullopt;
+    }
+    unsigned long long size = 0;
+    unsigned long long resident = 0;
+    const int read = std::fscanf(file, "%llu %llu", &size, &resident);
+    std::fclose(file);
+    if (read != 2) {
+        return std::nullopt;
+    }
+    return static_cast<double>(resident) * static_cast<double>(::sysconf(_SC_PAGESIZE));
+#else
+    return std::nullopt;
+#endif
+}
+
+bool killProcess(double pid, int signal, std::string& error) {
+#if defined(_WIN32)
+    (void)signal;
+    HANDLE process = OpenProcess(PROCESS_TERMINATE, FALSE, static_cast<DWORD>(pid));
+    if (!process) {
+        error = errorText(static_cast<int>(GetLastError()));
+        return false;
+    }
+    const BOOL done = TerminateProcess(process, 1);
+    if (!done) {
+        error = errorText(static_cast<int>(GetLastError()));
+    }
+    CloseHandle(process);
+    return done != 0;
+#else
+    if (::kill(static_cast<pid_t>(pid), signal) != 0) {
+        error = errorText(errno);
+        return false;
+    }
+    return true;
+#endif
+}
 
 } // namespace sys
 
@@ -1260,6 +1907,11 @@ sys::ExecSpec readExecSpec(lua_State* L) {
     }
     lua_pop(L, 1);
 
+#if !defined(_WIN32)
+    if (!spec.env.empty()) {
+        sys::listEnv(spec.baseEnv); // here, on the VM's thread: the child is started on a worker
+    }
+#endif
     return spec;
 }
 
@@ -1267,26 +1919,756 @@ sys::ExecSpec readExecSpec(lua_State* L) {
 int processExec(lua_State* L) {
     checkExecArguments(L);
 
-    {
-        const sys::ExecOutcome outcome = sys::runExec(readExecSpec(L));
-
-        if (outcome.launched) {
-            lua_createtable(L, 0, 4);
-
-            lua_pushboolean(L, outcome.code == 0);
-            lua_setfield(L, -2, "ok");
-            lua_pushnumber(L, outcome.code);
-            lua_setfield(L, -2, "code");
-            lua_pushlstring(L, outcome.out.data(), outcome.out.size());
-            lua_setfield(L, -2, "stdout");
-            lua_pushlstring(L, outcome.err.data(), outcome.err.size());
-            lua_setfield(L, -2, "stderr");
+    auto spec = std::make_shared<sys::ExecSpec>(readExecSpec(L));
+    return sched::Scheduler::of(L).await(L, [spec]() -> sched::Completion {
+        auto outcome = std::make_shared<sys::ExecOutcome>(sys::runExec(*spec));
+        return [outcome](lua_State* T) {
+            if (!outcome->launched) {
+                lua_pushlstring(T, outcome->error.data(), outcome->error.size());
+                return sched::kRaise;
+            }
+            lua_createtable(T, 0, 4);
+            lua_pushboolean(T, outcome->code == 0);
+            lua_setfield(T, -2, "ok");
+            lua_pushnumber(T, outcome->code);
+            lua_setfield(T, -2, "code");
+            lua_pushlstring(T, outcome->out.data(), outcome->out.size());
+            lua_setfield(T, -2, "stdout");
+            lua_pushlstring(T, outcome->err.data(), outcome->err.size());
+            lua_setfield(T, -2, "stderr");
             return 1;
+        };
+    });
+}
+
+// ---- signals ----
+
+struct SignalName {
+    const char* name;  // what scripts use
+    const char* alias; // the traditional name without "SIG"
+    int number;
+    bool catchable;
+};
+
+#if defined(_WIN32)
+// Pseudo numbers for the console events (matching the POSIX signals they resemble).
+constexpr int kSigInterrupt = 2;
+constexpr int kSigBreak = 21;
+constexpr int kSigHangup = 1;
+
+constexpr SignalName kSignals[] = {
+    {"interrupt", "INT", kSigInterrupt, true},
+    {"break", "BREAK", kSigBreak, true},
+    {"hangup", "HUP", kSigHangup, true},
+    {"terminate", "TERM", 15, false},
+    {"kill", "KILL", 9, false},
+};
+#else
+constexpr SignalName kSignals[] = {
+    {"interrupt", "INT", SIGINT, true},   {"terminate", "TERM", SIGTERM, true}, {"hangup", "HUP", SIGHUP, true},
+    {"quit", "QUIT", SIGQUIT, true},      {"user1", "USR1", SIGUSR1, true},     {"user2", "USR2", SIGUSR2, true},
+    {"resize", "WINCH", SIGWINCH, true},  {"alarm", "ALRM", SIGALRM, true},     {"continue", "CONT", SIGCONT, true},
+    {"kill", "KILL", SIGKILL, false},     {"stop", "STOP", SIGSTOP, false},
+};
+#endif
+
+const SignalName* findSignal(int number) {
+    for (const SignalName& signal : kSignals) {
+        if (signal.number == number) {
+            return &signal;
+        }
+    }
+    return nullptr;
+}
+
+void pushSignalName(lua_State* L, int number) {
+    if (const SignalName* signal = findSignal(number)) {
+        lua_pushstring(L, signal->name);
+    } else {
+        lua_pushfstring(L, "SIG%d", number);
+    }
+}
+
+bool sameText(const char* a, const char* b) {
+    for (; *a && *b; ++a, ++b) {
+        if (std::tolower(static_cast<unsigned char>(*a)) != std::tolower(static_cast<unsigned char>(*b))) {
+            return false;
+        }
+    }
+    return *a == *b;
+}
+
+// A signal argument: a name ("interrupt", "SIGINT", "INT") or a number. Raises if unknown.
+int checkSignal(lua_State* L, int index, const char* fallback) {
+    if (lua_type(L, index) == LUA_TNUMBER) {
+        const int number = luaL_checkinteger(L, index);
+        luaL_argcheck(L, number > 0 && number < 128, index, "signal number out of range");
+        return number;
+    }
+    const char* text = luaL_optstring(L, index, fallback);
+    const char* bare = (std::strlen(text) > 3 && sameText(std::string(text, 3).c_str(), "sig")) ? text + 3 : text;
+    for (const SignalName& signal : kSignals) {
+        if (sameText(text, signal.name) || sameText(bare, signal.alias)) {
+            return signal.number;
+        }
+    }
+    luaL_argerror(L, index, lua_pushfstring(L, "unknown signal '%s'", text));
+}
+
+constexpr const char* kSignalHandlersKey = "sonata.process.signals"; // { [number] = handler }
+
+// Runs on a VM's thread (posted by the hub): starts that VM's handler as a task.
+void runSignalHandler(lua_State* L, int number) {
+    lua_getfield(L, LUA_REGISTRYINDEX, kSignalHandlersKey);
+    if (!lua_istable(L, -1)) {
+        return;
+    }
+    lua_rawgeti(L, -1, number);
+    if (!lua_isfunction(L, -1)) {
+        return;
+    }
+    pushSignalName(L, number);
+    sched::Scheduler::of(L).spawn(L, lua_gettop(L) - 1);
+}
+
+// Process-wide: OS signal handlers can only be installed once per process, so
+// every VM that wants a signal subscribes here and gets it posted to its scheduler.
+class SignalHub {
+  public:
+    static SignalHub& instance() {
+        static SignalHub* hub = new SignalHub(); // never destroyed: the OS handler may still fire at exit
+        return *hub;
+    }
+
+    void subscribe(int number, const std::shared_ptr<sched::Remote>& remote) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& list = subscribers_[number];
+        prune(list);
+        for (const auto& weak : list) {
+            if (weak.lock() == remote) {
+                return;
+            }
+        }
+        list.push_back(remote);
+        if (list.size() == 1) {
+            install(number, true);
+        }
+    }
+
+    void unsubscribe(int number, const std::shared_ptr<sched::Remote>& remote) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& list = subscribers_[number];
+        list.erase(std::remove_if(list.begin(), list.end(),
+                                  [&](const auto& weak) { return weak.expired() || weak.lock() == remote; }),
+                   list.end());
+        if (list.empty()) {
+            install(number, false);
+        }
+    }
+
+    // Called (on some thread) when signal "number" arrives. False if nobody listens.
+    bool deliver(int number) {
+        std::vector<std::shared_ptr<sched::Remote>> targets;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto& list = subscribers_[number];
+            prune(list);
+            for (const auto& weak : list) {
+                if (auto remote = weak.lock()) {
+                    targets.push_back(std::move(remote));
+                }
+            }
+        }
+        bool delivered = false;
+        for (const auto& remote : targets) {
+            delivered = remote->post([number](lua_State* L) { runSignalHandler(L, number); }) || delivered;
+        }
+        return delivered;
+    }
+
+  private:
+    static void prune(std::vector<std::weak_ptr<sched::Remote>>& list) {
+        list.erase(std::remove_if(list.begin(), list.end(), [](const auto& weak) { return weak.expired(); }),
+                   list.end());
+    }
+
+#if defined(_WIN32)
+    static BOOL WINAPI consoleHandler(DWORD event) {
+        int number = 0;
+        switch (event) {
+        case CTRL_C_EVENT:
+            number = kSigInterrupt;
+            break;
+        case CTRL_BREAK_EVENT:
+            number = kSigBreak;
+            break;
+        case CTRL_CLOSE_EVENT:
+            number = kSigHangup;
+            break;
+        default:
+            return FALSE;
+        }
+        return instance().deliver(number) ? TRUE : FALSE;
+    }
+
+    void install(int, bool) {
+        if (!consoleInstalled_) {
+            consoleInstalled_ = SetConsoleCtrlHandler(consoleHandler, TRUE) != 0;
+        }
+    }
+
+    bool consoleInstalled_ = false;
+#else
+    // The OS handler only writes the signal number to a pipe (that is all a signal
+    // handler may safely do); a thread of ours reads it and does the rest.
+    static int& pipeWriteEnd() {
+        static int fd = -1;
+        return fd;
+    }
+
+    static void onSignal(int number) {
+        const int saved = errno;
+        const unsigned char byte = static_cast<unsigned char>(number);
+        const ssize_t ignored = ::write(pipeWriteEnd(), &byte, 1);
+        (void)ignored;
+        errno = saved;
+    }
+
+    void install(int number, bool on) {
+        if (on && pipeWriteEnd() < 0) {
+            int fds[2];
+            if (::pipe(fds) != 0) {
+                return;
+            }
+            ::fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+            ::fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+            ::fcntl(fds[1], F_SETFL, ::fcntl(fds[1], F_GETFL) | O_NONBLOCK);
+            pipeWriteEnd() = fds[1];
+            const int readEnd = fds[0];
+            std::thread([readEnd] {
+                for (;;) {
+                    unsigned char byte = 0;
+                    const ssize_t got = ::read(readEnd, &byte, 1);
+                    if (got == 1) {
+                        instance().deliver(byte);
+                    } else if (got < 0 && errno == EINTR) {
+                        continue;
+                    } else {
+                        return;
+                    }
+                }
+            }).detach();
         }
 
-        lua_pushlstring(L, outcome.error.data(), outcome.error.size());
+        struct sigaction action{};
+        sigemptyset(&action.sa_mask);
+        action.sa_flags = SA_RESTART;
+        action.sa_handler = on ? onSignal : SIG_DFL;
+        ::sigaction(number, &action, nullptr);
+    }
+#endif
+
+    std::mutex mutex_;
+    std::map<int, std::vector<std::weak_ptr<sched::Remote>>> subscribers_;
+};
+
+// process.onSignal(signal: string | number, handler: ((name: string) -> ())?)
+int processOnSignal(lua_State* L) {
+    const int number = checkSignal(L, 1, nullptr);
+    const SignalName* known = findSignal(number);
+    luaL_argcheck(L, known == nullptr || known->catchable, 1, "this signal cannot be handled");
+#if defined(_WIN32)
+    luaL_argcheck(L, known != nullptr && known->catchable, 1,
+                  "only \"interrupt\", \"break\" and \"hangup\" can be handled on Windows");
+#endif
+    if (!lua_isnoneornil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TFUNCTION);
+    }
+
+    lua_getfield(L, LUA_REGISTRYINDEX, kSignalHandlersKey);
+    lua_pushvalue(L, 2);
+    lua_rawseti(L, -2, number);
+    lua_pop(L, 1);
+
+    const std::shared_ptr<sched::Remote> remote = sched::Scheduler::of(L).remote();
+    if (lua_isnoneornil(L, 2)) {
+        SignalHub::instance().unsubscribe(number, remote);
+    } else {
+        SignalHub::instance().subscribe(number, remote);
+    }
+    return 0;
+}
+
+// process.kill(pid: number, signal: (string | number)?): true | (nil, string)
+int processKill(lua_State* L) {
+    const double pid = luaL_checknumber(L, 1);
+    luaL_argcheck(L, pid > 0 && pid == std::floor(pid), 1, "pid must be a positive whole number");
+    const int number = checkSignal(L, 2, "terminate");
+
+    {
+        std::string error;
+        if (sys::killProcess(pid, number, error)) {
+            lua_pushboolean(L, 1);
+            return 1;
+        }
+        lua_pushnil(L);
+        lua_pushlstring(L, error.data(), error.size());
+    }
+    return 2;
+}
+
+// ---- the running process ----
+
+const std::chrono::steady_clock::time_point kStartTime = std::chrono::steady_clock::now();
+
+// process.uptime(): number
+int processUptime(lua_State* L) {
+    lua_pushnumber(L, std::chrono::duration<double>(std::chrono::steady_clock::now() - kStartTime).count());
+    return 1;
+}
+
+// process.memoryUsage(): { rss: number?, luauHeap: number }
+int processMemoryUsage(lua_State* L) {
+    lua_createtable(L, 0, 2);
+    if (const std::optional<double> rss = sys::residentMemory()) {
+        lua_pushnumber(L, *rss);
+        lua_setfield(L, -2, "rss");
+    }
+    lua_pushnumber(L, static_cast<double>(lua_gc(L, LUA_GCCOUNT, 0)) * 1024.0 + lua_gc(L, LUA_GCCOUNTB, 0));
+    lua_setfield(L, -2, "luauHeap");
+    return 1;
+}
+
+// ---- process.spawn ----
+
+constexpr const char* kChildMeta = "sonata.process.Child";
+constexpr const char* kChildHandlesKey = "sonata.process.children"; // child table -> ChildHandle (weak keys)
+constexpr const char* kPipeMeta = "sonata.process.Pipe";
+
+struct ChildHandle {
+    sys::ChildPtr child;
+};
+
+struct PipeHandle {
+    sys::PipePtr pipe;
+    bool readable = false;
+    const char* name = "";
+};
+
+const char* const kStdioModes[] = {"pipe", "inherit", "null", nullptr};
+const char* const kStreamFields[] = {"stdin", "stdout", "stderr"};
+
+// Validates program, args and the options process.spawn understands.
+void checkSpawnArguments(lua_State* L) {
+    std::size_t length = 0;
+    const char* program = luaL_checklstring(L, 1, &length);
+    luaL_argcheck(L, length != 0 && hasNoNul(program, length), 1, "program must be a non-empty string without null bytes");
+
+    if (!lua_isnoneornil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TTABLE);
+        const int count = lua_objlen(L, 2);
+        for (int i = 1; i <= count; ++i) {
+            lua_rawgeti(L, 2, i);
+            luaL_argcheck(L, lua_type(L, -1) == LUA_TSTRING, 2, "args must be an array of strings");
+            const char* arg = lua_tolstring(L, -1, &length);
+            luaL_argcheck(L, hasNoNul(arg, length), 2, "args must not contain null bytes");
+            lua_pop(L, 1);
+        }
+    }
+
+    if (lua_isnoneornil(L, 3)) {
+        return;
+    }
+    luaL_checktype(L, 3, LUA_TTABLE);
+
+    lua_getfield(L, 3, "cwd");
+    if (!lua_isnil(L, -1)) {
+        const char* cwd = lua_type(L, -1) == LUA_TSTRING ? lua_tolstring(L, -1, &length) : nullptr;
+        luaL_argcheck(L, cwd && length != 0 && hasNoNul(cwd, length), 3, "option 'cwd' must be a non-empty string without null bytes");
+    }
+    lua_pop(L, 1);
+
+    for (const char* flag : {"shell", "detached"}) {
+        lua_getfield(L, 3, flag);
+        if (!lua_isnil(L, -1) && lua_type(L, -1) != LUA_TBOOLEAN) {
+            luaL_error(L, "invalid option '%s' (boolean expected, got %s)", flag, luaL_typename(L, -1));
+        }
+        lua_pop(L, 1);
+    }
+
+    for (const char* field : {"stdio", "stdin", "stdout", "stderr"}) {
+        lua_getfield(L, 3, field);
+        if (!lua_isnil(L, -1)) {
+            bool valid = false;
+            if (lua_type(L, -1) == LUA_TSTRING) {
+                for (const char* const* mode = kStdioModes; *mode; ++mode) {
+                    valid = valid || std::strcmp(lua_tostring(L, -1), *mode) == 0;
+                }
+            }
+            if (!valid) {
+                luaL_error(L, "invalid option '%s' (expected \"pipe\", \"inherit\" or \"null\")", field);
+            }
+        }
+        lua_pop(L, 1);
+    }
+
+    lua_getfield(L, 3, "env");
+    if (!lua_isnil(L, -1)) {
+        luaL_argcheck(L, lua_istable(L, -1), 3, "option 'env' must be a table of strings");
+        lua_pushnil(L);
+        while (lua_next(L, -2) != 0) {
+            luaL_argcheck(L, lua_type(L, -2) == LUA_TSTRING && lua_type(L, -1) == LUA_TSTRING, 3,
+                          "option 'env' must map strings to strings");
+            std::size_t nameLength = 0;
+            std::size_t valueLength = 0;
+            const char* name = lua_tolstring(L, -2, &nameLength);
+            const char* value = lua_tolstring(L, -1, &valueLength);
+            luaL_argcheck(L, nameLength != 0 && hasNoNul(name, nameLength) && !std::strchr(name, '='), 3,
+                          "option 'env' has an invalid variable name");
+            luaL_argcheck(L, hasNoNul(value, valueLength), 3, "option 'env' values must not contain null bytes");
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+}
+
+sys::StdioMode modeOf(const char* text) {
+    if (std::strcmp(text, "inherit") == 0) {
+        return sys::StdioMode::Inherit;
+    }
+    return std::strcmp(text, "null") == 0 ? sys::StdioMode::Null : sys::StdioMode::Pipe;
+}
+
+// Copies the (validated) arguments. Raises nothing.
+sys::SpawnSpec readSpawnSpec(lua_State* L) {
+    sys::SpawnSpec spec;
+    std::size_t length = 0;
+    const char* program = lua_tolstring(L, 1, &length);
+    spec.exec.program.assign(program, length);
+
+    if (lua_istable(L, 2)) {
+        const int count = lua_objlen(L, 2);
+        for (int i = 1; i <= count; ++i) {
+            lua_rawgeti(L, 2, i);
+            const char* arg = lua_tolstring(L, -1, &length);
+            spec.exec.args.emplace_back(arg, length);
+            lua_pop(L, 1);
+        }
+    }
+    if (!lua_istable(L, 3)) {
+        return spec;
+    }
+
+    lua_getfield(L, 3, "cwd");
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        const char* cwd = lua_tolstring(L, -1, &length);
+        spec.exec.cwd = std::string(cwd, length);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 3, "shell");
+    spec.exec.shell = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    lua_getfield(L, 3, "detached");
+    spec.detached = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+
+    lua_getfield(L, 3, "stdio");
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        const sys::StdioMode all = modeOf(lua_tostring(L, -1));
+        spec.modes[0] = spec.modes[1] = spec.modes[2] = all;
+    }
+    lua_pop(L, 1);
+    for (int i = 0; i < 3; ++i) {
+        lua_getfield(L, 3, kStreamFields[i]);
+        if (lua_type(L, -1) == LUA_TSTRING) {
+            spec.modes[i] = modeOf(lua_tostring(L, -1));
+        }
+        lua_pop(L, 1);
+    }
+
+    lua_getfield(L, 3, "env");
+    if (lua_istable(L, -1)) {
+        lua_pushnil(L);
+        while (lua_next(L, -2) != 0) {
+            std::size_t nameLength = 0;
+            std::size_t valueLength = 0;
+            const char* name = lua_tolstring(L, -2, &nameLength);
+            const char* value = lua_tolstring(L, -1, &valueLength);
+            spec.exec.env.emplace_back(std::string(name, nameLength), std::string(value, valueLength));
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+
+#if !defined(_WIN32)
+    if (!spec.exec.env.empty()) {
+        sys::listEnv(spec.exec.baseEnv);
+    }
+#endif
+    return spec;
+}
+
+template <typename T>
+T* newHandle(lua_State* L, const char* meta) {
+    void* memory = lua_newuserdatadtor(L, sizeof(T), [](lua_State*, void* p) { static_cast<T*>(p)->~T(); });
+    T* handle = new (memory) T();
+    luaL_getmetatable(L, meta);
+    lua_setmetatable(L, -2);
+    return handle;
+}
+
+void pushPipe(lua_State* L, const sys::PipePtr& pipe, bool readable, const char* name) {
+    PipeHandle* handle = newHandle<PipeHandle>(L, kPipeMeta);
+    handle->pipe = pipe;
+    handle->readable = readable;
+    handle->name = name;
+}
+
+// process.spawn(program: string, args: { string }?, options: SpawnOptions?): Child
+int processSpawn(lua_State* L) {
+    checkSpawnArguments(L);
+    lua_settop(L, 3);
+
+    {
+        sys::Spawned spawned = sys::spawnChild(readSpawnSpec(L));
+        if (spawned.error.empty()) {
+            lua_createtable(L, 0, 4); // 4: the child
+#if defined(_WIN32)
+            lua_pushnumber(L, static_cast<double>(spawned.child->pid));
+#else
+            lua_pushnumber(L, static_cast<double>(spawned.child->pid));
+#endif
+            lua_setfield(L, 4, "pid");
+            for (int i = 0; i < 3; ++i) {
+                if (spawned.pipes[i]) {
+                    pushPipe(L, spawned.pipes[i], i != 0, kStreamFields[i]);
+                    lua_setfield(L, 4, kStreamFields[i]);
+                }
+            }
+            luaL_getmetatable(L, kChildMeta);
+            lua_setmetatable(L, 4);
+
+            lua_getfield(L, LUA_REGISTRYINDEX, kChildHandlesKey);
+            lua_pushvalue(L, 4);
+            newHandle<ChildHandle>(L, kChildMeta)->child = std::move(spawned.child);
+            lua_rawset(L, -3);
+            lua_pop(L, 1);
+            return 1;
+        }
+        lua_pushlstring(L, spawned.error.data(), spawned.error.size());
     }
     luaL_error(L, "%s", lua_tostring(L, -1));
+}
+
+sys::ChildPtr checkChild(lua_State* L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    lua_getfield(L, LUA_REGISTRYINDEX, kChildHandlesKey);
+    lua_pushvalue(L, 1);
+    lua_rawget(L, -2);
+    auto* handle = static_cast<ChildHandle*>(lua_touserdata(L, -1));
+    lua_pop(L, 2);
+    luaL_argcheck(L, handle != nullptr, 1, "expected a child process");
+    return handle->child;
+}
+
+// Pushes { ok, code, signal? } for a child that has exited.
+void pushExit(lua_State* L, sys::ChildState& child) {
+    std::lock_guard<std::mutex> lock(child.mutex);
+    lua_createtable(L, 0, 3);
+    lua_pushboolean(L, child.code == 0 && child.signal == 0);
+    lua_setfield(L, -2, "ok");
+    lua_pushnumber(L, child.code);
+    lua_setfield(L, -2, "code");
+    if (child.signal != 0) {
+        pushSignalName(L, child.signal);
+        lua_setfield(L, -2, "signal");
+    }
+}
+
+// child:wait(timeout: number?): ExitStatus | (nil, string)
+int childWait(lua_State* L) {
+    const sys::ChildPtr child = checkChild(L);
+    double timeout = std::numeric_limits<double>::infinity();
+    if (!lua_isnoneornil(L, 2)) {
+        timeout = luaL_checknumber(L, 2);
+        luaL_argcheck(L, timeout >= 0, 2, "timeout must not be negative");
+    }
+
+    return sched::Scheduler::of(L).await(L, [child, timeout]() -> sched::Completion {
+        const bool exited = sys::waitExit(*child, timeout);
+        return [child, exited](lua_State* T) {
+            if (!exited) {
+                lua_pushnil(T);
+                lua_pushstring(T, "timed out");
+                return 2;
+            }
+            pushExit(T, *child);
+            return 1;
+        };
+    });
+}
+
+// child:status(): ExitStatus?
+int childStatus(lua_State* L) {
+    const sys::ChildPtr child = checkChild(L);
+    bool exited = false;
+    {
+        std::lock_guard<std::mutex> lock(child->mutex);
+        exited = sys::pollExit(*child);
+    }
+    if (exited) {
+        pushExit(L, *child);
+    } else {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
+// child:kill(signal: (string | number)?): boolean
+int childKill(lua_State* L) {
+    const sys::ChildPtr child = checkChild(L);
+    const int number = checkSignal(L, 2, "terminate");
+    std::string error;
+    lua_pushboolean(L, sys::killChild(*child, number, error));
+    return 1;
+}
+
+PipeHandle* checkPipe(lua_State* L, int readable) {
+    auto* handle = static_cast<PipeHandle*>(luaL_checkudata(L, 1, kPipeMeta));
+    if (readable == 1) {
+        luaL_argcheck(L, handle->readable, 1, "stdin can only be written to");
+    } else if (readable == 0) {
+        luaL_argcheck(L, !handle->readable, 1, "stdout and stderr can only be read from");
+    }
+    return handle;
+}
+
+enum class ReadKind { Some, Line, All };
+
+// Takes what "kind" asks for from the pipe's buffer and pushes the results.
+// Returns -1 (pushing nothing) if the buffer cannot answer yet.
+int consume(lua_State* L, sys::PipeEnd& pipe, ReadKind kind, std::size_t max, bool keepEnding) {
+    std::lock_guard<std::mutex> lock(pipe.mutex);
+    std::string& buffer = pipe.buffer;
+    const bool ended = pipe.eof || pipe.closed;
+
+    if (kind == ReadKind::Some && !buffer.empty()) {
+        const std::size_t take = std::min(max, buffer.size());
+        lua_pushlstring(L, buffer.data(), take);
+        buffer.erase(0, take);
+        return 1;
+    }
+    if (kind == ReadKind::Line) {
+        const std::size_t newline = buffer.find('\n');
+        if (newline != std::string::npos || (ended && !buffer.empty())) {
+            std::size_t length = newline == std::string::npos ? buffer.size() : newline + 1;
+            std::size_t keep = length;
+            if (!keepEnding && newline != std::string::npos) {
+                keep = newline > 0 && buffer[newline - 1] == '\r' ? newline - 1 : newline;
+            }
+            lua_pushlstring(L, buffer.data(), keep);
+            buffer.erase(0, length);
+            return 1;
+        }
+    }
+    if (kind == ReadKind::All && ended) {
+        if (buffer.empty() && !pipe.error.empty()) {
+            lua_pushnil(L);
+            lua_pushlstring(L, pipe.error.data(), pipe.error.size());
+            return 2;
+        }
+        lua_pushlstring(L, buffer.data(), buffer.size());
+        buffer.clear();
+        return 1;
+    }
+    if (!ended) {
+        return -1;
+    }
+    lua_pushnil(L);
+    if (!pipe.error.empty()) {
+        lua_pushlstring(L, pipe.error.data(), pipe.error.size());
+        return 2;
+    }
+    return 1;
+}
+
+int readPipe(lua_State* L, ReadKind kind, std::size_t max, bool keepEnding) {
+    PipeHandle* handle = checkPipe(L, 1);
+    const sys::PipePtr pipe = handle->pipe;
+
+    const int ready = consume(L, *pipe, kind, max, keepEnding);
+    if (ready >= 0) {
+        return ready;
+    }
+
+    return sched::Scheduler::of(L).await(L, [pipe, kind, max, keepEnding]() -> sched::Completion {
+        sys::fillUntil(*pipe, [kind](const std::string& buffer) {
+            if (kind == ReadKind::Some) {
+                return !buffer.empty();
+            }
+            return kind == ReadKind::Line && buffer.find('\n') != std::string::npos;
+        });
+        return [pipe, kind, max, keepEnding](lua_State* T) {
+            const int n = consume(T, *pipe, kind, max, keepEnding);
+            if (n >= 0) {
+                return n;
+            }
+            lua_pushnil(T); // closed while we waited
+            return 1;
+        };
+    });
+}
+
+// pipe:read(max: number?): string?
+int pipeRead(lua_State* L) {
+    const int max = luaL_optinteger(L, 2, 64 * 1024);
+    luaL_argcheck(L, max >= 1, 2, "max must be at least 1");
+    return readPipe(L, ReadKind::Some, static_cast<std::size_t>(max), false);
+}
+
+// pipe:readLine(keepEnding: boolean?): string?
+int pipeReadLine(lua_State* L) {
+    return readPipe(L, ReadKind::Line, 0, lua_toboolean(L, 2) != 0);
+}
+
+// pipe:readAll(): string
+int pipeReadAll(lua_State* L) {
+    return readPipe(L, ReadKind::All, 0, false);
+}
+
+// pipe:write(data: string): true | (nil, string)
+int pipeWrite(lua_State* L) {
+    PipeHandle* handle = checkPipe(L, 0);
+    std::size_t length = 0;
+    const char* data = luaL_checklstring(L, 2, &length);
+
+    const sys::PipePtr pipe = handle->pipe;
+    auto text = std::make_shared<std::string>(data, length);
+    return sched::Scheduler::of(L).await(L, [pipe, text]() -> sched::Completion {
+        auto error = std::make_shared<std::string>(sys::writeTo(*pipe, *text));
+        return [error](lua_State* T) {
+            if (error->empty()) {
+                lua_pushboolean(T, 1);
+                return 1;
+            }
+            lua_pushnil(T);
+            lua_pushlstring(T, error->data(), error->size());
+            return 2;
+        };
+    });
+}
+
+// pipe:close()
+int pipeClose(lua_State* L) {
+    checkPipe(L, -1)->pipe->close();
+    return 0;
+}
+
+// tostring(pipe): "process.Pipe(stdout)"
+int pipeToString(lua_State* L) {
+    lua_pushfstring(L, "process.Pipe(%s)", checkPipe(L, -1)->name);
+    return 1;
 }
 
 constexpr NativeFunction kFunctions[] = {
@@ -1294,26 +2676,85 @@ constexpr NativeFunction kFunctions[] = {
     {"chdir", processChdir},
     {"exit", processExit},
     {"exec", processExec},
+    {"spawn", processSpawn},
+    {"kill", processKill},
+    {"onSignal", processOnSignal},
+    {"uptime", processUptime},
+    {"memoryUsage", processMemoryUsage},
 };
+
+constexpr NativeFunction kChildMethods[] = {
+    {"wait", childWait},
+    {"status", childStatus},
+    {"kill", childKill},
+};
+
+constexpr NativeFunction kPipeMethods[] = {
+    {"read", pipeRead},
+    {"readLine", pipeReadLine},
+    {"readAll", pipeReadAll},
+    {"write", pipeWrite},
+    {"close", pipeClose},
+};
+
+void registerTypes(lua_State* L) {
+    if (luaL_newmetatable(L, kChildMeta)) {
+        lua_createtable(L, 0, static_cast<int>(std::size(kChildMethods)));
+        setFunctions(L, kChildMethods);
+        lua_setreadonly(L, -1, 1);
+        lua_setfield(L, -2, "__index");
+        lua_pushstring(L, "process.Child");
+        lua_setfield(L, -2, "__type");
+        lua_pushstring(L, "locked");
+        lua_setfield(L, -2, "__metatable");
+    }
+    lua_pop(L, 1);
+
+    if (luaL_newmetatable(L, kPipeMeta)) {
+        lua_createtable(L, 0, static_cast<int>(std::size(kPipeMethods)));
+        setFunctions(L, kPipeMethods);
+        lua_setreadonly(L, -1, 1);
+        lua_setfield(L, -2, "__index");
+        lua_pushcfunction(L, pipeToString, "Pipe.__tostring");
+        lua_setfield(L, -2, "__tostring");
+        lua_pushstring(L, "process.Pipe");
+        lua_setfield(L, -2, "__type");
+        lua_pushstring(L, "locked");
+        lua_setfield(L, -2, "__metatable");
+    }
+    lua_pop(L, 1);
+
+    lua_createtable(L, 0, 0);
+    lua_createtable(L, 0, 1);
+    lua_pushstring(L, "k");
+    lua_setfield(L, -2, "__mode");
+    lua_setmetatable(L, -2);
+    lua_setfield(L, LUA_REGISTRYINDEX, kChildHandlesKey);
+
+    lua_getfield(L, LUA_REGISTRYINDEX, kSignalHandlersKey);
+    if (!lua_istable(L, -1)) {
+        lua_createtable(L, 0, 0);
+        lua_setfield(L, LUA_REGISTRYINDEX, kSignalHandlersKey);
+    }
+    lua_pop(L, 1);
+}
 
 } // namespace
 
 // The opener: runs once per VM and returns the library table.
 void openProcess(lua_State* L) {
-    lua_createtable(L, 0, static_cast<int>(std::size(kFunctions)) + 8);
+    registerTypes(L);
+
+    lua_createtable(L, 0, static_cast<int>(std::size(kFunctions)) + 5);
     setFunctions(L, kFunctions);
-
-    lua_pushstring(L, sys::osName());
-    lua_setfield(L, -2, "os");
-
-    lua_pushstring(L, sys::archName());
-    lua_setfield(L, -2, "arch");
-
-    lua_pushstring(L, sys::endiannessName());
-    lua_setfield(L, -2, "endianness");
 
     lua_pushnumber(L, sys::processId());
     lua_setfield(L, -2, "pid");
+
+    if (const std::optional<double> parent = sys::parentProcessId()) {
+        lua_pushnumber(L, *parent);
+        lua_setfield(L, -2, "ppid");
+    }
 
     {
         std::string path;
@@ -1323,7 +2764,7 @@ void openProcess(lua_State* L) {
         }
     }
 
-    // The host's argument list, if it provided one.
+    // The program's arguments, if the host provided them.
     lua_getfield(L, LUA_REGISTRYINDEX, kArgsRegistryKey);
     if (!lua_istable(L, -1)) {
         lua_pop(L, 1);
@@ -1334,19 +2775,5 @@ void openProcess(lua_State* L) {
     pushEnvironmentProxy(L);
     lua_setfield(L, -2, "env");
 }
-
-// host API implementation //////////
-namespace process {
-
-void setArguments(lua_State* L, const std::vector<std::string>& args) {
-    lua_createtable(L, static_cast<int>(args.size()), 0);
-    for (std::size_t i = 0; i < args.size(); ++i) {
-        lua_pushlstring(L, args[i].data(), args[i].size());
-        lua_rawseti(L, -2, static_cast<int>(i) + 1);
-    }
-    lua_setfield(L, LUA_REGISTRYINDEX, kArgsRegistryKey);
-}
-
-} // namespace process
 
 } // namespace sonata::lib::libs

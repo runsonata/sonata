@@ -8,6 +8,8 @@ add_executable(sonata_tests
   main.cpp
   test_luau.cpp
   test_builtins.cpp
+  test_build.cpp
+  test_runtime.cpp
 )
 
 target_link_libraries(sonata_tests PRIVATE

@@ -4,8 +4,6 @@
 #include <sonata/core/library.hpp>
 #include "lua.h"
 
-#include "libs/libs.hpp"
-
 namespace sonata::lib {
 
 namespace {
@@ -24,7 +22,7 @@ bool isValidLibraryName(std::string_view name) {
 
 void setFunctions(lua_State* L, const NativeFunction* functions, std::size_t count) {
     for (std::size_t i = 0; i < count; ++i) {
-        lua_pushcfunction(L, functions[i].function, functions[i].name);
+        lua_pushcclosurek(L, functions[i].function, functions[i].name, 0, functions[i].continuation);
         lua_setfield(L, -2, functions[i].name);
     }
 }
@@ -62,25 +60,6 @@ std::vector<std::string> LibraryRegistry::names() const {
     }
 
     return result; // std::map is already sorted
-}
-
-// Add all builtin libraries here
-void registerBuiltinLibraries(LibraryRegistry& registry) {
-    //registry.add({"example", libs::openExample});
-    registry.add({"fs", libs::openFs});
-    registry.add({"path", libs::openPath});
-    registry.add({"sys", libs::openSys});
-    registry.add({"task", libs::openTask});
-    registry.add({"process", libs::openProcess});
-    registry.add({"stdio", libs::openStdio});
-    registry.add({"net", libs::openNet});
-    registry.add({"json", libs::openJson});
-    registry.add({"crypto", libs::openCrypto});
-    registry.add({"datetime", libs::openDatetime});
-    registry.add({"compress", libs::openCompress});
-    registry.add({"regex", libs::openRegex});
-    registry.add({"serde", libs::openSerde});
-    registry.add({"sonata", libs::openSonata});
 }
 
 } // namespace sonata::lib

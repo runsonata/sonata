@@ -153,6 +153,14 @@ public:
 
     static DataValue parseFile(const std::filesystem::path& path);
 
+    /*
+     * The "--!name" directives at the top of "source" (before any code), e.g.
+     * { "strict" } for a file starting with "--!strict". Only the directive's
+     * name is returned. Never throws for a syntax error; the directives that
+     * could be read are returned.
+     */
+    static std::vector<std::string> directives(const std::string& source);
+
     /* "value" must be a Table; produces "return { ... }\n". */
     static std::string serialize(const DataValue& value);
 

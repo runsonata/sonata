@@ -58,6 +58,38 @@ public:
     };
 
     /*
+     * The manifest's optional "build" table. "sn build" reads all of it;
+     * "sn run" uses "libraries" and "assets" too, so a program behaves the
+     * same before and after it's built.
+     *
+     *     build = {
+     *         output     = "dist/app",         -- ".exe" is added on Windows
+     *         libraries  = { "fs", "term" },  -- built-ins this package uses (nil = all)
+     *         assets     = { "assets" },       -- files/folders for @sonata/pocket
+     *         optimize   = 1,                  -- Luau optimization level, 0..2
+     *         debug      = 1,                  -- Luau debug level, 0..2
+     *         compress   = true,               -- compress the packed program
+     *         standalone = false,              -- no shared-library dependencies at all
+     *     },
+     *
+     * Fields left out are std::nullopt (or empty), so callers can tell "not
+     * given" from a value. A dependency's manifest only contributes
+     * "libraries" and "assets"; the rest is the root project's call.
+     *
+     * Library names are not checked here (see selection.hpp), so a manifest
+     * naming a library this Sonata doesn't know still opens.
+     */
+    struct Build {
+        std::optional<std::string> output;
+        std::optional<std::vector<std::string>> libraries;
+        std::vector<std::string> assets;
+        std::optional<int> optimize;
+        std::optional<int> debug;
+        std::optional<bool> compress;
+        std::optional<bool> standalone;
+    };
+
+    /*
      * Parsed contents of .sonata/project.luau.
      *
      * "entrypoint" is stored exactly as written in the manifest (e.g.
@@ -73,6 +105,15 @@ public:
         std::vector<std::string> authors;
         std::string entrypoint;
         std::vector<Dependency> dependencies;
+        Build build;
+
+        /*
+         * True if project.luau starts with a "--!strict" line. Anything that
+         * would only be a warning about this package's build settings (such
+         * as a missing build.libraries) becomes an error instead. In the root
+         * project it applies to every dependency as well.
+         */
+        bool strict = false;
     };
 
     /**
@@ -123,8 +164,10 @@ public:
      * The file is replaced atomically (temp file + rename), so a failed
      * save leaves the old manifest untouched.
      *
-     * Top-level keys this class doesn't know about are preserved, but
-     * comments and formatting are not: the file is regenerated.
+     * Top-level keys this class doesn't manage (including "build") are
+     * preserved as they were, and a "--!strict" line is written back if
+     * manifest().strict is set. Other comments and formatting are not kept:
+     * the file is regenerated.
      */
     void saveManifest() const;
 

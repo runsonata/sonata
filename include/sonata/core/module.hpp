@@ -80,6 +80,20 @@ class ModuleSource {
         (void)directory;
         return std::nullopt;
     }
+
+    /*
+     * The "entrypoint" the manifest of the package rooted at "directory"
+     * names, exactly as written (e.g. "src/init.luau"). Requiring the folder
+     * itself loads that file instead of init.luau.
+     *
+     * std::nullopt if "directory" isn't a package root or its manifest doesn't
+     * name one. Like dependencyNames(), the default says "not a package".
+     */
+    virtual std::optional<std::string>
+    packageEntrypoint(std::string_view directory) const {
+        (void)directory;
+        return std::nullopt;
+    }
 };
 
 /*
@@ -93,6 +107,10 @@ class FileSystemSource final : public ModuleSource {
     /* Reads <directory>/.sonata/project.luau through Project::open(). */
     std::optional<std::vector<std::string>>
     dependencyNames(std::string_view directory) const override;
+
+    /* Reads "entrypoint" from <directory>/.sonata/project.luau. */
+    std::optional<std::string>
+    packageEntrypoint(std::string_view directory) const override;
 
   private:
     Compiler compiler_;
@@ -113,20 +131,29 @@ class MemorySource final : public ModuleSource {
     void add(std::string_view path, Bytecode bytecode);
 
     /* Records that the folder "directory" (rooted at "/", like add()) is a
-       package whose manifest declares these dependencies. Use "/" for the
-       project itself and e.g. "/.sonata/deps/foo" for a dependency. Throws
-       std::invalid_argument if the path climbs above the root. */
+       package whose manifest declares these dependencies, and (if not empty)
+       this entrypoint. Use "/" for the project itself and e.g.
+       "/.sonata/deps/foo" for a dependency. Throws std::invalid_argument if
+       the path climbs above the root. */
     void addPackage(std::string_view directory,
-                    std::vector<std::string> dependencies);
+                    std::vector<std::string> dependencies,
+                    std::string entrypoint = {});
 
     bool exists(std::string_view path) const override;
     Bytecode load(std::string_view path) const override;
     std::optional<std::vector<std::string>>
     dependencyNames(std::string_view directory) const override;
+    std::optional<std::string>
+    packageEntrypoint(std::string_view directory) const override;
 
   private:
+    struct Package {
+        std::vector<std::string> dependencies;
+        std::string entrypoint;
+    };
+
     std::unordered_map<std::string, Bytecode> files_;
-    std::unordered_map<std::string, std::vector<std::string>> packages_;
+    std::unordered_map<std::string, Package> packages_;
 };
 
 /*
@@ -200,11 +227,29 @@ class ModuleLoader {
      * The entry goes through the same machinery as required modules, so its
      * chunk name is its path and relative requires work from it. It may return
      * anything. Throws ModuleError, including a stack trace, if it fails.
+     *
+     * The entry runs as the first task of the VM's scheduler (see
+     * sonata/core/scheduler.hpp), and run() keeps the scheduler going until
+     * nothing is left to do: tasks the entry started outlive it. Errors in
+     * those tasks are reported, not thrown; an error in the entry itself stops
+     * everything.
      */
     void run(VM &vm, std::string_view entry);
 
     // Registers an extra built-in: require("@sonata/<name>")
     void addLibrary(lib::NativeLibrary library);
+
+    /*
+     * Only lets scripts require the built-in libraries named in "allowed";
+     * requiring any other one fails with an error that ends in "hint" (e.g.
+     * where to add the library). Used to enforce build.libraries, so that
+     * "sn run" refuses exactly what a built program wouldn't have.
+     *
+     * Names that aren't registered are ignored. Without a call to this, every
+     * registered library is available.
+     */
+    void restrictLibraries(const std::vector<std::string>& allowed,
+                           std::string hint = {});
 
   private:
     static int requireCallback(lua_State *L);
@@ -232,6 +277,8 @@ class ModuleLoader {
     std::optional<Package> packageOf(const std::string &file) const;
 
     lib::LibraryRegistry libraries_;
+    std::optional<std::vector<std::string>> allowedLibraries_; // sorted
+    std::string restrictionHint_;
 
     std::unique_ptr<ModuleSource> source_;
     std::unordered_map<std::string, std::string> aliases_;
@@ -243,7 +290,10 @@ class ModuleLoader {
     mutable std::unordered_map<std::string,
                                std::optional<std::vector<std::string>>>
         manifests_;
-    
+
+    // Package entrypoints already looked up, by folder (see packageEntrypoint()).
+    mutable std::unordered_map<std::string, std::optional<std::string>>
+        entrypoints_;
 };
 
 } // namespace sonata::luau
