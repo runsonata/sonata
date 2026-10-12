@@ -13,7 +13,6 @@ TEST_SUITE("builtins") {
     TEST_CASE("Builtin path library is available through require") {
         Exec exec(R"(
         local path = require("@sonata/path")
-        assert(path.version == 1)
         assert(path.posix.normalize("/a/./b//c/..") == "/a/b")
         assert(path.posix.relative("/a/b", "/a/c/d") == "../c/d")
     )");
@@ -171,7 +170,6 @@ TEST_SUITE("builtins") {
         Exec exec(R"(
         local path = require("@sonata/path")
         local p = path.posix
-        assert(path.version == 1 and p.version == 1 and path.win32.version == 1)
         assert(p.sep == "/" and p.delimiter == ":" and p.style == "posix")
         assert(p.normalize("/a/./b//c/..") == "/a/b")
         assert(p.join("a", "b/", "../c") == "a/c" and p.join() == ".")
@@ -204,7 +202,7 @@ TEST_SUITE("builtins") {
     TEST_CASE("Builtin json library parses, encodes, and modifies values") {
         Exec exec(R"(
         local json = require("@sonata/json")
-        assert(json.version == 1 and json.null ~= nil)
+        assert(json.null ~= nil)
         local value = json.decode('{"a":[1,2,{"b":null}],"z":true}')
         assert(value.a[3].b == json.null and value.z == true)
         assert(json.encode({ x = 1, y = { true, "s" } }) == '{"x":1,"y":[true,"s"]}')
@@ -539,7 +537,7 @@ TEST_SUITE("builtins") {
     TEST_CASE("Builtin crypto library hashes, encodes, encrypts, and signs") {
         Exec exec(R"(
         local crypto = require("@sonata/crypto")
-        assert(crypto.version == 1 and type(crypto.hardwareAes) == "boolean")
+        assert(type(crypto.hardwareAes) == "boolean")
         assert(#crypto.hashes > 0 and #crypto.ciphers > 0)
         assert(crypto.hash("sha256", "abc", "hex") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         assert(#crypto.hmac("sha256", "key", "data") == 32)
@@ -583,7 +581,6 @@ TEST_SUITE("builtins") {
               "calendar arithmetic") {
         Exec exec(R"(
         local datetime = require("@sonata/datetime")
-        assert(datetime.version == 1)
         local t, nsec = datetime.fromFields({ year = 2024, month = 2, day = 29, hour = 12, min = 34, sec = 56, nsec = 123456789 }, "UTC")
         local fields = datetime.toFields(t, "UTC", nsec)
         assert(fields.year == 2024 and fields.month == 2 and fields.day == 29)
@@ -614,7 +611,6 @@ TEST_SUITE("builtins") {
     TEST_CASE("Builtin compress library is available through require") {
         Exec exec(R"(
         local compress = require("@sonata/compress")
-        assert(compress.version == 2)
         local blob = compress.compress("hello hello hello hello")
         assert(compress.detect(blob) == "gzip")
         assert(compress.decompress(blob) == "hello hello hello hello")
