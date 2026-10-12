@@ -33,6 +33,16 @@ jobs:
       if: runner.os == 'Windows'
       run: choco install openssl
 
+    - name: Install zlib (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        vcpkg install zlib:x64-windows-static-md
+        $zlib = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
+        Copy-Item "$zlib\lib\zs.lib" "$zlib\lib\zlib.lib"
+        Copy-Item "$zlib\debug\lib\zsd.lib" "$zlib\debug\lib\zlibd.lib"
+        "CMAKE_PREFIX_PATH=$zlib" >> $env:GITHUB_ENV
+
     - name: Build and Run Tests
       run: bash ./b.sh test release
       

@@ -1900,7 +1900,7 @@ double asn1Seconds(const ASN1_TIME* time) {
 #endif
 }
 
-std::string nameText(X509_NAME* name) {
+std::string nameText(const X509_NAME* name) {
     BIO* bio = BIO_new(BIO_s_mem());
     if (bio == nullptr) {
         return {};
