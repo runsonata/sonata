@@ -78,6 +78,70 @@ bool validate_directory_path(const fs::path &path, std::string &error) {
     return true;
 }
 
+enum class ExistingProjectChoice { Overwrite, Clear, Cancel };
+
+/*  Prompting:
+    Asks the user what to do when the target directory already holds a
+    Sonata project. Keeps asking until a valid choice is given. If stdin
+    is closed (e.g. not interactive), cancels.
+*/
+ExistingProjectChoice prompt_existing_project(const fs::path &root) {
+    std::cout << "A Sonata project already exists at " << root << "\n"
+              << "  1. Initialize anyway (overwrites main.luau and "
+                 ".sonata/project.luau)\n"
+              << "  2. Clear the folder and initialize\n"
+              << "  3. Cancel\n";
+
+    std::string line;
+    while (true) {
+        std::cout << "Choose an option [1-3]: " << std::flush;
+
+        if (!std::getline(std::cin, line)) {
+            std::cout << "\n";
+            return ExistingProjectChoice::Cancel;
+        }
+
+        if (line == "1")
+            return ExistingProjectChoice::Overwrite;
+        if (line == "2")
+            return ExistingProjectChoice::Clear;
+        if (line == "3")
+            return ExistingProjectChoice::Cancel;
+
+        std::cout << "Please enter 1, 2 or 3.\n";
+    }
+}
+
+/*  Clearing:
+    Removes everything inside a directory, but not the directory itself.
+*/
+bool clear_directory(const fs::path &root, std::string &error) {
+    std::error_code ec;
+    std::vector<fs::path> entries;
+
+    // Collect first, so we aren't removing entries while iterating.
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end;
+         it.increment(ec))
+        entries.push_back(it->path());
+
+    if (ec) {
+        error = "could not read directory '" + root.string() +
+                "': " + ec.message();
+        return false;
+    }
+
+    for (const auto &entry : entries) {
+        fs::remove_all(entry, ec);
+        if (ec) {
+            error = "could not remove '" + entry.string() +
+                    "': " + ec.message();
+            return false;
+        }
+    }
+
+    return true;
+}
+
 namespace sonata::commands {
 
 int init(int argc, char **argv) {
@@ -160,6 +224,24 @@ int init(int argc, char **argv) {
             << luau::DataFile::parseFile(project->projectFile()).serialize()
             << "\n";
         return 0;
+    }
+
+    if (fs::exists(sonata / "project.luau", ec)) {
+        switch (prompt_existing_project(root)) {
+        case ExistingProjectChoice::Overwrite:
+            break;
+        case ExistingProjectChoice::Clear: {
+            std::string clearerror;
+            if (!clear_directory(root, clearerror)) {
+                std::cerr << "error: " << clearerror << "\n";
+                return 1;
+            }
+            break;
+        }
+        case ExistingProjectChoice::Cancel:
+            std::cout << "Cancelled.\n";
+            return 0;
+        }
     }
 
     try {
