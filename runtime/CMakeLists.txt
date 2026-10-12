@@ -25,7 +25,10 @@ else()
   endif()
 
   # libstdc++ isn't guaranteed to be on the machine a program ends up on.
-  if(SONATA_STATIC_DEPS AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  # Android (e.g. Termux) has no static libc++, so the flag makes clang look
+  # for a libc++_shared.a that doesn't exist.
+  if(SONATA_STATIC_DEPS AND NOT APPLE AND NOT ANDROID
+     AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_link_options(snrt PRIVATE -static-libstdc++ -static-libgcc)
   endif()
 endif()

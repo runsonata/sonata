@@ -304,7 +304,18 @@ std::string machineArch() {
 }
 
 bool loadAverage(double (&loads)[3]) {
+#if defined(__ANDROID__) && __ANDROID_API__ < 29
+    struct sysinfo info;
+    if (::sysinfo(&info) != 0) {
+        return false;
+    }
+    for (int i = 0; i < 3; ++i) {
+        loads[i] = static_cast<double>(info.loads[i]) / 65536.0; // fixed point, 1 << 16
+    }
+    return true;
+#else
     return ::getloadavg(loads, 3) == 3;
+#endif
 }
 
 OptNumber pageSize() {
