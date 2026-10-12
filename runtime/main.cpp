@@ -41,7 +41,7 @@ int runBundle(sonata::bundle::Bundle bundle, const fs::path &executable,
         source->add(module.path, std::move(module.bytecode));
     }
 
-    // Declared before the loader and the VM, so it outlives both.
+    // Declare this before the loader and VM or freddy fazbear will come to your house
     MemoryPocket pocket;
 
     for (bundle::Package &package : bundle.packages) {
@@ -54,7 +54,7 @@ int runBundle(sonata::bundle::Bundle bundle, const fs::path &executable,
         pocket.add(asset.package, asset.path, std::move(asset.data));
     }
 
-    // The loader must outlive the VM (runProgram creates and destroys it).
+    // The loader must outlive the VM (runProgram creates and destroys it)
     luau::ModuleLoader loader(std::move(source));
     for (const auto &[name, directory] : bundle.aliases) {
         loader.addAlias(name, directory);

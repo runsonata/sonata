@@ -25,7 +25,7 @@ void pushMime(lua_State* L);    // net.mime
 void pushWs(lua_State* L);      // net.ws
 void pushTls(lua_State* L);     // net.tls
 
-// Winsock must be started before any socket call on Windows. Safe to call often.
+// Winsock must be started before any socket call on Windows. Safe to call (i hope)
 void ensureNetworking();
 
 // helpers ////////////////////////////////////////////////////////////////////
@@ -79,6 +79,7 @@ bool isTokenChar(char c);
 bool isToken(std::string_view text);
 
 // Percent-encoding: everything except A-Z a-z 0-9 - . _ ~ and "safe" becomes %XX.
+// Yea no ai did this im not making encoding on mobile
 void percentEncode(std::string& out, std::string_view text, std::string_view safe);
 bool percentDecode(std::string& out, std::string_view text, bool plusAsSpace);
 

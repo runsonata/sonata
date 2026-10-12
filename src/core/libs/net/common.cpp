@@ -95,7 +95,7 @@ void registerType(lua_State* L, const char* name, const char* typeName, const Fu
 namespace {
 constexpr char kBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 }
-
+// THANK YOU CLAUDE
 std::string base64Encode(std::string_view data) {
     std::string out;
     out.reserve((data.size() + 2) / 3 * 4);

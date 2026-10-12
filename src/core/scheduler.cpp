@@ -330,7 +330,7 @@ struct Scheduler::State {
 
     double now() const { return std::chrono::duration<double>(Clock::now() - origin).count(); }
 
-    // Waiters ----------------------------------------------------------------
+    // Waiters ///////////////////////////
 
     Waiter& newWaiter(lua_State* thread, Kind kind, double deadline) {
         const std::uint64_t id = nextId++;
@@ -460,7 +460,7 @@ struct Scheduler::State {
         return true;
     }
 
-    // Outcome records -----------------------------------------------------------
+    // Outcome records ////////////////////////////
 
     // Pushes results[thread] (or nil) on aux.
     void pushRecord(lua_State* thread) const {
@@ -517,8 +517,8 @@ struct Scheduler::State {
         endRecord();
     }
 
-    // Running threads -------------------------------------------------------------
-
+    // Running threads /////////////////////
+    
     void report(lua_State* thread) {
         ThreadError error{thread, describeError(thread), lua_debugtrace(thread)};
         if (onError) {
@@ -591,7 +591,7 @@ struct Scheduler::State {
         return status;
     }
 
-    // The loop ------------------------------------------------------------------
+    // The loop /////////////////////
 
     double nextDeadline() {
         while (!deadlines.empty()) {
