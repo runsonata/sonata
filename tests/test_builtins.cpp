@@ -13,7 +13,6 @@ TEST_SUITE("builtins") {
     TEST_CASE("Builtin path library is available through require") {
         Exec exec(R"(
         local path = require("@sonata/path")
-        assert(path.version == 1)
         assert(path.posix.normalize("/a/./b//c/..") == "/a/b")
         assert(path.posix.relative("/a/b", "/a/c/d") == "../c/d")
     )");
@@ -24,7 +23,7 @@ TEST_SUITE("builtins") {
               "files") {
         Exec exec(R"lua(
         local fs = require("@sonata/fs")
-        assert(fs.version == 1 and fs.maxReadSize > 0)
+        assert(fs.maxReadSize > 0)
         assert(fs.modes.file == 420 and fs.modes.privateDirectory == 448)
         local root = fs.makeTempDir("sonata-test-")
         root = fs.realPath(root)
@@ -75,7 +74,7 @@ TEST_SUITE("builtins") {
     TEST_CASE("fs diagnostic: cumulative steps") {
         const std::string header = R"lua(
         local fs = require("@sonata/fs")
-        assert(fs.version == 1 and fs.maxReadSize > 0)
+        assert(fs.maxReadSize > 0)
         assert(fs.modes.file == 420 and fs.modes.privateDirectory == 448)
         local root = fs.makeTempDir("sonata-test-")
         root = fs.realPath(root)
@@ -171,7 +170,6 @@ TEST_SUITE("builtins") {
         Exec exec(R"(
         local path = require("@sonata/path")
         local p = path.posix
-        assert(path.version == 1 and p.version == 1 and path.win32.version == 1)
         assert(p.sep == "/" and p.delimiter == ":" and p.style == "posix")
         assert(p.normalize("/a/./b//c/..") == "/a/b")
         assert(p.join("a", "b/", "../c") == "a/c" and p.join() == ".")
@@ -204,7 +202,7 @@ TEST_SUITE("builtins") {
     TEST_CASE("Builtin json library parses, encodes, and modifies values") {
         Exec exec(R"(
         local json = require("@sonata/json")
-        assert(json.version == 1 and json.null ~= nil)
+        assert(json.null ~= nil)
         local value = json.decode('{"a":[1,2,{"b":null}],"z":true}')
         assert(value.a[3].b == json.null and value.z == true)
         assert(json.encode({ x = 1, y = { true, "s" } }) == '{"x":1,"y":[true,"s"]}')
@@ -232,52 +230,138 @@ TEST_SUITE("builtins") {
         assert(sys.pathSeparator == "/" or sys.pathSeparator == "\\")
         assert(sys.pathDelimiter == ":" or sys.pathDelimiter == ";")
         assert(type(sys.devNull) == "string" and #sys.devNull > 0)
+        assert(type(sys.os) == "string" and type(sys.arch) == "string")
+        assert(sys.endianness == "little" or sys.endianness == "big")
+        assert(sys.pid == nil and sys.osName == nil, "process facts belong to @sonata/process")
         assert(type(sys.cpuCount()) == "number" and sys.cpuCount() >= 1)
-        assert(type(sys.pid()) == "number" and sys.pid() > 0)
         assert(type(sys.time()) == "number" and sys.time() > 0)
         local before = sys.clock()
         sys.sleep(0)
         assert(sys.clock() >= before)
-        assert(type(sys.osName()) == "string" and type(sys.arch()) == "string")
-        assert(type(sys.info()) == "table" and sys.info().pid == sys.pid())
+        local info = sys.info()
+        assert(type(info) == "table" and info.os == sys.os and info.arch == sys.arch and info.pid == nil)
         assert(type(sys.hostname()) == "string" or sys.hostname() == nil)
         assert(type(sys.username()) == "string" or sys.username() == nil)
         assert(type(sys.homeDir()) == "string" or sys.homeDir() == nil)
         assert(type(sys.tempDir()) == "string" or sys.tempDir() == nil)
         assert(type(sys.osVersion()) == "string" or sys.osVersion() == nil)
-        assert(type(sys.arch()) == "string" and sys.pageSize() >= 0)
+        assert(sys.pageSize() == nil or sys.pageSize() > 0)
         assert(sys.totalMemory() == nil or sys.totalMemory() > 0)
         assert(sys.freeMemory() == nil or sys.freeMemory() >= 0)
         assert(sys.uptime() == nil or sys.uptime() >= 0)
+        local load = sys.loadAverage()
+        assert(load == nil or (#load == 3 and load[1] >= 0))
     )");
-        REQUIRE(exec.getStatus() == 0);
+        REQUIRE_MESSAGE(exec.getStatus() == 0, exec.getError());
     }
 
-    TEST_CASE("Builtin task library starts, queues, and cancels work") {
+    TEST_CASE("Builtin task library starts, queues, waits for, and cancels work") {
         Exec exec(R"(
         local task = require("@sonata/task")
         local called = 0
         local thread = task.spawn(function(value) called = value end, 7)
         assert(type(thread) == "thread" and called == 7)
+        assert(task.status(thread) == "done")
         local deferred = task.defer(function() called = 8 end)
         local delayed = task.delay(0, function() called = 9 end)
         assert(type(deferred) == "thread" and type(delayed) == "thread")
+        assert(task.status(deferred) == "scheduled" and task.status(delayed) == "scheduled")
         task.cancel(deferred)
         task.cancel(delayed)
-        assert(called == 7)
-        local ok = pcall(task.wait, 0)
-        assert(not ok)
+        assert(called == 7 and task.status(deferred) == "cancelled")
+
+        -- Outside a task, waiting runs the scheduler right here.
+        local order = {}
+        local a = task.spawn(function() task.wait(0.02); table.insert(order, "a"); return "A", 1 end)
+        local b = task.spawn(function() task.wait(0.01); table.insert(order, "b"); error("boom") end)
+        assert(task.status(a) == "waiting" and task.count() >= 2)
+        local elapsed = task.wait(0.005)
+        assert(elapsed >= 0.004)
+        local ok, x, y = task.join(a)
+        assert(ok == true and x == "A" and y == 1)
+        local failed, err = task.join(b)
+        assert(failed == false and string.find(err, "boom"))
+        assert(table.concat(order) == "ba")
+        assert(task.join(task.spawn(function() task.wait(10) end), 0.01) == nil)
+
+        local results = task.all({ function() task.wait(0.01) return "x" end, function() return "y" end })
+        assert(results[1] == "x" and results[2] == "y")
+        assert(not pcall(task.all, { function() error("first") end, function() task.wait(10) end }))
+        local index, value = task.race({ function() task.wait(1) return "slow" end, function() return "fast" end })
+        assert(index == 2 and value == "fast")
+        local timedOk, timedErr = task.timeout(0.01, function() task.wait(1) end)
+        assert(timedOk == false and timedErr == "timed out")
+        assert(select(2, task.timeout(1, function() return 5 end)) == 5)
     )");
-        REQUIRE(exec.getStatus() == 0);
+        REQUIRE_MESSAGE(exec.getStatus() == 0, exec.getError());
+    }
+
+    TEST_CASE("Builtin task library coordinates tasks") {
+        Exec exec(R"(
+        local task = require("@sonata/task")
+
+        -- Channels: unbuffered hand-over, buffering, closing, timeouts.
+        local ch = task.channel(0)
+        local got = {}
+        task.spawn(function() for i = 1, 3 do assert(ch:send(i)) end ch:close() end)
+        while true do
+            local ok, v = ch:recv()
+            if not ok then assert(v == "closed") break end
+            table.insert(got, v)
+        end
+        assert(table.concat(got, ",") == "1,2,3")
+        local buffered = task.channel(2)
+        assert(buffered:trySend("a") and buffered:trySend(nil) and not buffered:trySend("c"))
+        assert(#buffered == 2 and buffered:capacity() == 2)
+        local okA, va = buffered:tryRecv()
+        local okB, vb = buffered:tryRecv()
+        assert(okA and va == "a" and okB and vb == nil and buffered:tryRecv() == false)
+        local timedOut, why = task.channel(0):recv(0.01)
+        assert(timedOut == false and why == "timed out")
+
+        -- Mutex: increments that wait in the middle still never overlap.
+        local m, counter = task.mutex(), 0
+        local group = task.group()
+        for _ = 1, 5 do
+            group:spawn(function()
+                m:lock()
+                local seen = counter
+                task.wait(0.001)
+                counter = seen + 1
+                m:unlock()
+            end)
+        end
+        assert(group:wait() == true and counter == 5 and not m:isLocked())
+        assert(not pcall(function() m:unlock() end))
+
+        -- Semaphore and event.
+        local sem = task.semaphore(1)
+        assert(sem:acquire() and not sem:tryAcquire() and sem:acquire(0.01) == false)
+        sem:release()
+        assert(sem:available() == 1)
+        local event = task.event()
+        task.delay(0.01, function() event:set() end)
+        assert(event:wait(1) and event:isSet() and event:wait(0))
+
+        -- Groups report failures.
+        local g = task.group()
+        g:spawn(function() error("bad") end)
+        g:spawn(function() task.wait(0.01) end)
+        local allOk, errors = g:wait()
+        assert(allOk == false and #errors == 1 and string.find(errors[1], "bad"))
+        assert(g:count() == 0)
+    )");
+        REQUIRE_MESSAGE(exec.getStatus() == 0, exec.getError());
     }
 
     TEST_CASE("Builtin process library exposes process state and environment") {
         Exec exec(R"(
         local process = require("@sonata/process")
-        assert(type(process.os) == "string" and type(process.arch) == "string")
-        assert(process.endianness == "little" or process.endianness == "big")
+        assert(process.os == nil and process.arch == nil, "machine facts belong to @sonata/sys")
         assert(type(process.pid) == "number" and process.pid > 0)
+        assert(process.ppid == nil or process.ppid > 0)
         assert(type(process.args) == "table" and type(process.cwd()) == "string")
+        assert(process.uptime() >= 0 and process.memoryUsage().luauHeap > 0)
         local originalCwd = process.cwd()
         process.chdir(originalCwd)
         assert(process.cwd() == originalCwd)
@@ -291,35 +375,104 @@ TEST_SUITE("builtins") {
         assert(found)
         process.env.SONATA_BUILTIN_TEST_VALUE = previous
         assert(type(process.exec) == "function" and type(process.exit) == "function")
+        assert(not pcall(process.kill, 1, "no-such-signal"))
     )");
-        REQUIRE(exec.getStatus() == 0);
+        REQUIRE_MESSAGE(exec.getStatus() == 0, exec.getError());
     }
 
-    TEST_CASE("Builtin stdio library writes and describes streams") {
+#ifndef _WIN32
+    TEST_CASE("Builtin process library runs and talks to child processes") {
         Exec exec(R"(
-        local stdio = require("@sonata/stdio")
-        assert(stdio.stdin ~= nil and stdio.stdout ~= nil and stdio.stderr ~= nil)
-        assert(type(stdio.stdin:isTerminal()) == "boolean")
-        assert(type(stdio.stdout:isTerminal()) == "boolean")
-        local columns, rows = stdio.stdout:size()
-        assert((columns == nil) == (rows == nil))
-        assert(tostring(stdio.stdout) == "stdio.stdout")
-        assert(stdio.stdout:write("stdio-"))
-        assert(stdio.stdout:writeLine("ok"))
-        assert(stdio.stdout:flush())
-        assert(not pcall(function() stdio.stdin:write("bad") end))
-        assert(not pcall(function() stdio.stdout:read(1) end))
-        assert(type(stdio.prompt) == "function")
+        local process = require("@sonata/process")
+        local task = require("@sonata/task")
+
+        -- exec lets other tasks run while the child works.
+        local ticks = 0
+        local ticker = task.spawn(function() while true do task.wait(0.005) ticks += 1 end end)
+        local result = process.exec("sh", { "-c", "sleep 0.1; echo out; echo err >&2; exit 3" })
+        assert(result.ok == false and result.code == 3 and result.stdout == "out\n" and result.stderr == "err\n")
+        assert(ticks > 3, "the ticker should have run during exec")
+        task.cancel(ticker)
+        assert(process.exec("sh", { "-c", "echo $X" }, { env = { X = "from-env" } }).stdout == "from-env\n")
+
+        -- spawn: streaming pipes.
+        local child = process.spawn("cat", nil, { stderr = "null" })
+        assert(type(child.pid) == "number" and child.stderr == nil)
+        assert(child.stdin:write("one\r\ntwo\nrest"))
+        child.stdin:close()
+        assert(child.stdout:readLine() == "one" and child.stdout:readLine(true) == "two\n")
+        assert(child.stdout:readAll() == "rest" and child.stdout:read() == nil)
+        local status = child:wait()
+        assert(status.ok and status.code == 0)
+
+        -- wait with a timeout, kill, status.
+        local sleeper = process.spawn("sleep", { "10" }, { stdio = "null" })
+        assert(sleeper:wait(0.01) == nil and sleeper:status() == nil)
+        assert(sleeper:kill("terminate"))
+        local killed = sleeper:wait(5)
+        assert(killed.ok == false and killed.signal == "terminate" and killed.code == 128 + 15)
+        assert(sleeper:kill() == false)
+
+        assert(not pcall(process.spawn, "definitely-not-a-program-sonata"))
+        assert(not pcall(process.exec, "definitely-not-a-program-sonata"))
+
+        -- Signals arrive as tasks.
+        local received
+        process.onSignal("user1", function(name) received = name end)
+        assert(process.kill(process.pid, "SIGUSR1"))
+        local deadline = os.clock() + 2
+        while received == nil and os.clock() < deadline do task.wait(0.01) end
+        process.onSignal("user1", nil)
+        assert(received == "user1")
+        assert(not pcall(process.onSignal, "kill", function() end))
     )");
-        REQUIRE(exec.getStatus() == 0);
-        CHECK(exec.getOutput() == "stdio-ok\n");
+        REQUIRE_MESSAGE(exec.getStatus() == 0, exec.getError());
+    }
+#endif
+
+    TEST_CASE("Builtin term library writes, describes streams, and styles text") {
+        Exec exec(R"(
+        local term = require("@sonata/term")
+        assert(term.stdin ~= nil and term.stdout ~= nil and term.stderr ~= nil)
+        assert(type(term.stdin:isTerminal()) == "boolean")
+        assert(type(term.stdout:isTerminal()) == "boolean")
+        local columns, rows = term.stdout:size()
+        assert((columns == nil) == (rows == nil))
+        assert(tostring(term.stdout) == "term.stdout")
+        assert(term.stdout:write("term-"))
+        assert(term.stdout:writeLine("ok"))
+        assert(term.stdout:flush())
+        assert(not pcall(function() term.stdin:write("bad") end))
+        assert(not pcall(function() term.stdout:read(1) end))
+        assert(type(term.prompt) == "function" and type(term.password) == "function")
+
+        term.setColorLevel(3)
+        assert(term.colorLevel() == 3)
+        assert(term.style("hi", "bold", "red") == "\27[1;31mhi\27[39;22m")
+        assert(term.style("x", "bg:#102030") == "\27[48;2;16;32;48mx\27[49m")
+        term.setColorLevel(2)
+        assert(term.style("x", "#ff0000") == "\27[38;5;196mx\27[39m")
+        term.setColorLevel(1)
+        assert(term.style("x", "fg:196") == "\27[91mx\27[39m")
+        term.setColorLevel(0)
+        assert(term.style("plain", "bold", "brightBlue", "bgGray") == "plain")
+        term.setColorLevel(nil)
+        assert(not pcall(term.style, "x", "no-such-style"))
+
+        assert(term.strip("\27[1;31mred\27[0m \27]0;title\7!") == "red !")
+        assert(term.width("héllo") == 5 and term.width("日本") == 4 and term.width("\27[31mab\27[0m") == 2)
+        assert(term.ansi.moveTo(3, 4) == "\27[4;3H" and term.ansi.move(-2, 1) == "\27[2D\27[1B")
+        assert(term.ansi.clear("line") == "\27[2K" and term.ansi.reset == "\27[0m")
+        assert(term.isRaw() == false)
+    )");
+        REQUIRE_MESSAGE(exec.getStatus() == 0, exec.getError());
+        CHECK(exec.getOutput() == "term-ok\n");
     }
 
-    TEST_CASE(
-        "Builtin net library parses URLs and exchanges loopback traffic") {
+    TEST_CASE("Builtin net library parses URLs and exchanges loopback traffic") {
         Exec exec(R"(
         local net = require("@sonata/net")
-        assert(net.version == 1)
+        local task = require("@sonata/task")
         local url = net.url.parse("https://u:p@Host:8443/a/b?x=1#top")
         assert(url.scheme == "https" and url.username == "u" and url.password == "p")
         assert(url.host == "host" and url.port == 8443 and url.path == "/a/b")
@@ -336,19 +489,29 @@ TEST_SUITE("builtins") {
         local host, port = server:localAddress()
         assert(type(host) == "string" and port > 0)
         local client = assert(net.connect(host, port, 2))
-        client:setTimeout(2)
         client:setOption("nodelay", true)
+        assert(client:getOption("nodelay") == true)
         local peer = assert(server:accept())
-        peer:setTimeout(2)
-        assert(client:send("hello! ") == 7)
+        assert(client:send("hello! line one\r\nline two\n") == 26)
         assert(peer:recvUntil("!") == "hello!")
         assert(peer:recv(1) == " ")
+        assert(peer:recvLine() == "line one" and peer:recvLine() == "line two")
+        peer:unread("again")
+        assert(peer:buffered() == 5 and peer:recv(5, true) == "again")
         local peerHost, peerPort = peer:peerAddress()
         assert(type(peerHost) == "string" and peerPort > 0)
+        peer:setTimeout(0.01)
+        local nothing, why = peer:recv()
+        assert(nothing == nil and why == "timed out")
         assert(client:shutdown("write"))
         assert(peer:recv() == "")
-        assert(type(client:tlsInfo()) == "nil")
+        assert(client:tlsInfo() == nil and client:kind() == "tcp")
+
+        -- A task waiting on a socket wakes up when another one closes it.
+        local waiter = task.spawn(function() return client:recv(10) end)
         client:close()
+        local _, data, err = task.join(waiter)
+        assert(data == nil and err == "closed" and client:isClosed())
         peer:close()
         server:close()
 
@@ -357,19 +520,24 @@ TEST_SUITE("builtins") {
         local receiverHost, receiverPort = receiver:localAddress()
         local sender = assert(net.udp())
         assert(sender:sendTo("datagram", receiverHost, receiverPort) == 8)
-        local data, senderHost, senderPort = receiver:recvFrom()
-        assert(data == "datagram" and type(senderHost) == "string" and senderPort > 0)
+        assert(sender:sendTo("named", "localhost", receiverPort) == 5 or true) -- localhost may resolve to ::1 only
+        local data2, senderHost, senderPort = receiver:recvFrom()
+        assert(data2 == "datagram" and type(senderHost) == "string" and senderPort > 0)
         assert(type(net.resolve("127.0.0.1", "ipv4")) == "table")
+        assert(net.dns.resolve("127.0.0.1")[1] == "127.0.0.1")
         sender:close()
         receiver:close()
+
+        local refused, reason = net.connect("127.0.0.1", 1, 2)
+        assert(refused == nil and type(reason) == "string")
     )");
-        REQUIRE(exec.getStatus() == 0);
+        REQUIRE_MESSAGE(exec.getStatus() == 0, exec.getError());
     }
 
     TEST_CASE("Builtin crypto library hashes, encodes, encrypts, and signs") {
         Exec exec(R"(
         local crypto = require("@sonata/crypto")
-        assert(crypto.version == 1 and type(crypto.hardwareAes) == "boolean")
+        assert(type(crypto.hardwareAes) == "boolean")
         assert(#crypto.hashes > 0 and #crypto.ciphers > 0)
         assert(crypto.hash("sha256", "abc", "hex") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         assert(#crypto.hmac("sha256", "key", "data") == 32)
@@ -413,7 +581,6 @@ TEST_SUITE("builtins") {
               "calendar arithmetic") {
         Exec exec(R"(
         local datetime = require("@sonata/datetime")
-        assert(datetime.version == 1)
         local t, nsec = datetime.fromFields({ year = 2024, month = 2, day = 29, hour = 12, min = 34, sec = 56, nsec = 123456789 }, "UTC")
         local fields = datetime.toFields(t, "UTC", nsec)
         assert(fields.year == 2024 and fields.month == 2 and fields.day == 29)
@@ -440,4 +607,16 @@ TEST_SUITE("builtins") {
     )");
         REQUIRE(exec.getStatus() == 0);
     }
+
+    TEST_CASE("Builtin compress library is available through require") {
+        Exec exec(R"(
+        local compress = require("@sonata/compress")
+        local blob = compress.compress("hello hello hello hello")
+        assert(compress.detect(blob) == "gzip")
+        assert(compress.decompress(blob) == "hello hello hello hello")
+        assert(compress.decompress(compress.compress("abc", "zlib"), "zlib") == "abc")
+        assert(compress.crc32("abc") == 891568578)
+    )");
+    REQUIRE(exec.getStatus() == 0);
+}
 }

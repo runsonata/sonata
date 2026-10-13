@@ -11,6 +11,7 @@
 #include <sonata/core/luau/vm.hpp>
 #include <sonata/core/luau/compiler.hpp>
 #include <sonata/core/module.hpp>
+#include "lua.h"
 
 class TempDir {
   public:
@@ -111,16 +112,28 @@ class StdoutCapture {
     }
 };
 
+// Runs a chunk on the VM's main thread (not as a task: waits happen inline).
 class Exec {
 public:
     Exec(std::string_view code) {
         loader.install(vm);
         StdoutCapture capture;
-        status = vm.execute(comp.compile(code));
+        lua_State* L = vm.state();
+        const sonata::luau::Bytecode bytecode = comp.compile(code);
+        status = luau_load(L, "=test", bytecode.luauData(), bytecode.size(), 0);
+        if (status == 0) {
+            status = lua_pcall(L, 0, 0, 0);
+        }
+        if (status != 0) {
+            const char* message = lua_tostring(L, -1);
+            error = message ? message : "(error value is not a string)";
+            lua_pop(L, 1);
+        }
         output = capture.finish();
     }
 
     const std::string& getOutput() const { return output; }
+    const std::string& getError() const { return error; }
     int getStatus() const { return status; }
 
 private:
@@ -128,5 +141,6 @@ private:
     sonata::luau::VM vm;
     sonata::luau::Compiler comp;
     std::string output;
+    std::string error;
     int status = 0;
 };

@@ -2,7 +2,6 @@
 //
 //     local datetime = require("@sonata/datetime")
 //
-//     datetime.version                            --> 1
 //     datetime.now()                              --> t, nsec
 //     datetime.monotonic()                        --> seconds (only for measuring durations)
 //     datetime.toFields(t, zone?, nsec?)          --> { year, month, day, hour, min, sec, nsec,
@@ -1117,9 +1116,6 @@ constexpr NativeFunction kFunctions[] = {
 void openDatetime(lua_State* L) {
     lua_createtable(L, 0, static_cast<int>(std::size(kFunctions)) + 1);
     setFunctions(L, kFunctions);
-
-    lua_pushnumber(L, 1);
-    lua_setfield(L, -2, "version");
 }
 
 } // namespace sonata::lib::libs

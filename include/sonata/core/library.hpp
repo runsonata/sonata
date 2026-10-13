@@ -21,16 +21,24 @@ namespace sonata::lib {
 //
 // To write one:
 //   1. Write the functions as plain lua_CFunctions.
-//   2. Write an "opener" that pushes the module's value (normally a table).
-//   3. Add it to registerBuiltinLibraries() in library.cpp.
+//   2. Write an "opener" (libs::open<Name>) that pushes the module's value
+//      (normally a table), in src/core/libs/<name>.cpp.
+//   3. Add <name> to SONATA_ALL_LIBS in src/CMakeLists.txt; the registry is
+//      generated from that list.
 //
 // See src/core/libs/path.cpp for a complete example.
 
 // A function exposed to Luau. "name" is both its key in the library table and
 // the name shown in error messages and stack traces.
+//
+// "continuation" is only needed by functions that suspend the calling thread
+// through the scheduler and want to run again when it resumes (see
+// sonata/core/scheduler.hpp). It is the lua_Continuation Luau calls instead of
+// returning straight to the script.
 struct NativeFunction {
     const char* name;
     int (*function)(lua_State* L);
+    int (*continuation)(lua_State* L, int status) = nullptr;
 };
 
 // Called the first time a script requires the library.
@@ -76,7 +84,13 @@ private:
     std::map<std::string, NativeLibrary, std::less<>> libraries_;
 };
 
-// Adds every library that ships with sonata. ModuleLoader calls this itself.
+// Adds every library compiled into this binary. ModuleLoader calls this itself.
+// Which libraries that is depends on SONATA_LIBS at build time (see
+// src/CMakeLists.txt); a runtime built by "sn build" may have only a few.
 void registerBuiltinLibraries(LibraryRegistry& registry);
+
+// The names of every library Sonata knows about, sorted, whether or not this
+// binary has them compiled in. Used to validate build.libraries.
+const std::vector<std::string>& knownLibraryNames();
 
 } // namespace sonata::lib

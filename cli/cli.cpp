@@ -22,6 +22,7 @@
 #endif
 
 #include "cli.hpp"
+#include "commands/build.hpp"
 #include "commands/init.hpp"
 #include "commands/pkg.hpp"
 #include "commands/run.hpp"
@@ -152,7 +153,8 @@ const std::vector<Command> &commands() {
     static const std::vector<Command> commands = {
         commands::init_command(),
         commands::pkg_command(),
-        commands::run_command()
+        commands::run_command(),
+        commands::build_command()
     };
 
     return commands;

@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -160,6 +162,125 @@ std::vector<Project::Dependency> optionalDependencies(
     }
 
     return result;
+}
+
+// "where: build.<key> must be ..." helpers for the build table.
+std::optional<int> optionalLevel(
+    const luau::DataValue& build,
+    const std::string& key,
+    const std::string& where
+)
+{
+    const luau::DataValue* field = build.find(key);
+
+    if (!field || field->isNil())
+        return std::nullopt;
+
+    const double value = field->isNumber() ? field->asNumber() : -1.0;
+
+    if (value != 0.0 && value != 1.0 && value != 2.0)
+    {
+        throw std::runtime_error(
+            where + ": build." + key + " must be 0, 1 or 2"
+        );
+    }
+
+    return static_cast<int>(value);
+}
+
+std::optional<bool> optionalBoolean(
+    const luau::DataValue& build,
+    const std::string& key,
+    const std::string& where
+)
+{
+    const luau::DataValue* field = build.find(key);
+
+    if (!field || field->isNil())
+        return std::nullopt;
+
+    if (!field->isBoolean())
+    {
+        throw std::runtime_error(
+            where + ": build." + key + " must be true or false"
+        );
+    }
+
+    return field->asBoolean();
+}
+
+// A path inside the project, written relative to its root. "where" names the
+// field for the error message.
+void checkRelativePath(const std::string& path, const std::string& where)
+{
+    if (path.empty())
+        throw std::runtime_error(where + " must not be empty");
+
+    const fs::path p(path);
+
+    if (p.is_absolute() || p.has_root_name() || p.has_root_directory())
+        throw std::runtime_error(where + " must be relative to the project root ('" + path + "')");
+
+    const fs::path normal = p.lexically_normal();
+
+    if (normal.empty() || *normal.begin() == "..")
+        throw std::runtime_error(where + " points outside the project ('" + path + "')");
+
+    if (normal == ".")
+        throw std::runtime_error(where + " must name a file or folder inside the project, not the project itself");
+}
+
+Project::Build optionalBuild(
+    const luau::DataValue& table,
+    const std::string& where
+)
+{
+    Project::Build build;
+
+    const luau::DataValue* field = table.find("build");
+
+    if (!field || field->isNil())
+        return build;
+
+    if (!field->isTable())
+        throw std::runtime_error(where + ": field 'build' must be a table");
+
+    const luau::DataValue& b = *field;
+
+    if (const luau::DataValue* output = b.find("output"); output && !output->isNil())
+    {
+        if (!output->isString())
+            throw std::runtime_error(where + ": build.output must be a string");
+
+        build.output = output->asString();
+        if (build.output->empty())
+            throw std::runtime_error(where + ": build.output must not be empty");
+    }
+
+    if (const luau::DataValue* libraries = b.find("libraries"); libraries && !libraries->isNil())
+    {
+        if (!libraries->isTable() || !libraries->isArray())
+        {
+            throw std::runtime_error(
+                where + ": build.libraries must be a plain array of library names, "
+                "e.g. { \"fs\", \"path\" }"
+            );
+        }
+
+        build.libraries = optionalStringArray(b, "libraries", where + ": build");
+    }
+
+    build.assets = optionalStringArray(b, "assets", where + ": build");
+
+    for (const std::string& asset : build.assets)
+        checkRelativePath(asset, where + ": build.assets entry");
+
+    build.optimize = optionalLevel(b, "optimize", where);
+    build.debug = optionalLevel(b, "debug", where);
+    build.compress = optionalBoolean(b, "compress", where);
+    build.standalone = optionalBoolean(b, "standalone", where);
+
+    return build;
 }
 
 // Manifest writing
@@ -477,9 +598,18 @@ void Project::loadManifest() {
     const std::string where = projectFile_.string();
 
     luau::DataValue table;
+    std::string source;
 
     try {
-        table = luau::DataFile::parseFile(projectFile_);
+        std::ifstream file(projectFile_, std::ios::binary);
+        if (!file)
+            throw std::runtime_error("could not open the file");
+
+        std::ostringstream contents;
+        contents << file.rdbuf();
+        source = contents.str();
+
+        table = luau::DataFile::parse(source, "=" + where);
     } catch (const std::exception& e) {
         throw std::runtime_error(
             "Failed to parse " + where + ": " + e.what()
@@ -496,6 +626,10 @@ void Project::loadManifest() {
     manifest_.authors = optionalStringArray(table, "authors", where);
     manifest_.dependencies = optionalDependencies(table, where);
     manifest_.entrypoint = optionalString(table, "entrypoint", "main.luau", where);
+    manifest_.build = optionalBuild(table, where);
+
+    const std::vector<std::string> directives = luau::DataFile::directives(source);
+    manifest_.strict = std::find(directives.begin(), directives.end(), "strict") != directives.end();
 
     // Resolve + confine the entrypoint to the project root: project.luau
     // shouldn't be able to point outside of it (e.g. "../../etc/passwd").
@@ -601,7 +735,19 @@ void Project::saveManifest() const {
     temp += ".tmp";
 
     try {
-        luau::DataFile::save(table, temp);
+        {
+            std::ofstream file(temp, std::ios::binary);
+            if (!file)
+                throw std::runtime_error("could not open for writing: " + temp.string());
+
+            if (manifest_.strict)
+                file << "--!strict\n";
+
+            file << luau::DataFile::serialize(table);
+
+            if (!file)
+                throw std::runtime_error("could not write " + temp.string());
+        }
         fs::rename(temp, projectFile_);
     } catch (const std::exception& e) {
         std::error_code ignored;

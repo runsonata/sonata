@@ -11,7 +11,6 @@
 //     path.sep                               --> "/"       ("\\" on Windows)
 //     path.delimiter                         --> ":"       (";"  on Windows)
 //     path.style                             --> "posix"   ("win32" on Windows)
-//     path.version                           --> 1
 //     path.posix, path.win32                 --> the same API for one fixed style
 //
 // Building and normalizing (results never end in a separator, except roots)
@@ -943,8 +942,6 @@ void pushStyle(lua_State* L) {
     lua_setfield(L, -2, "delimiter");
     lua_pushstring(L, S::kStyle);
     lua_setfield(L, -2, "style");
-    lua_pushnumber(L, 1);
-    lua_setfield(L, -2, "version");
 }
 
 } // namespace

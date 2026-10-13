@@ -9,15 +9,12 @@
 #include <utility>
 #include <vector>
 
-#include "lua.h"
-#include "lualib.h"
-
-#include <sonata/core/info.hpp>
-#include <sonata/core/luau/environment.hpp>
-#include <sonata/core/luau/vm.hpp>
 #include <sonata/core/package.hpp>
+#include <sonata/core/pocket.hpp>
 #include <sonata/core/project.hpp>
 #include <sonata/core/module.hpp>
+#include <sonata/core/runtime.hpp>
+#include <sonata/core/selection.hpp>
 
 #include "commands/run.hpp"
 
@@ -33,12 +30,17 @@ namespace sonata::commands {
  *   2. PackageManager  Makes sure the declared dependencies are installed
  *                      (--install fetches them, otherwise it's an error) and
  *                      registers an "@name" alias for each one.
- *   3. ModuleLoader    Serves require() from disk. FileSystemSource compiles
+ *   3. Libraries       selectLibraries() works out which built-ins the
+ *                      project (and its dependencies) declared in
+ *                      build.libraries; the rest are refused, exactly as a
+ *                      program made by "sn build" wouldn't have them.
+ *   4. ModuleLoader    Serves require() from disk. FileSystemSource compiles
  *                      .luau files on demand with the Compiler.
- *   4. VM + Environment
- *                      Creates the VM, adds the "sonata" and "args" globals,
- *                      installs require(), sandboxes the globals.
- *   5. ModuleLoader::run() executes the entrypoint like any other module.
+ *   5. runProgram()    Creates the VM with the "sonata" and "args" globals,
+ *                      installs require() and @sonata/pocket (reading the
+ *                      declared build.assets from disk), sandboxes the
+ *                      globals and runs the entrypoint. Built programs go
+ *                      through the same function (see runtime/main.cpp).
  */
 
 namespace {
@@ -167,50 +169,19 @@ void prepareDependencies(PackageManager &packages, const Project &project,
     }
 }
 
-/*
- * The "sonata" global:
- *
- *     sonata.version          "0.1.0"
- *     sonata.platform         "linux-x64"
- *     sonata.entry            module path of the script being run
- *     sonata.project.name     from the manifest
- *     sonata.project.version  from the manifest
- *     sonata.project.root     absolute path of the project folder
- */
-luau::EnvNamespace makeSonataNamespace(const Project &project,
-                                       const std::string &entry) {
-    luau::EnvNamespace projectInfo;
-    projectInfo.setString("name", project.manifest().name);
-    projectInfo.setString("version", project.manifest().version);
-    projectInfo.setString("root", project.root().generic_string());
-
-    luau::EnvNamespace sonata;
-    sonata.setString("version", info::version_string());
-    sonata.setString("platform", info::platform_string());
-    sonata.setString("entry", entry);
-    sonata.set("project",
-               std::make_shared<luau::EnvNamespace>(std::move(projectInfo)));
-    return sonata;
-}
-
-/*
- * The "args" global: an array of the strings given after "--" (empty if
- * none). Set before luaL_sandbox(), which makes it read-only.
- *
- * It's built with the Lua API rather than through Environment because
- * Environment keys everything by name, so it can't express a real array.
- */
-void setScriptArguments(lua_State *L, const std::vector<std::string> &args) {
-    lua_createtable(L, static_cast<int>(args.size()), 0);
-    for (std::size_t i = 0; i < args.size(); ++i) {
-        lua_pushlstring(L, args[i].data(), args[i].size());
-        lua_rawseti(L, -2, static_cast<int>(i) + 1);
+// A folder on disk as a module path (see module.hpp).
+std::string modulePath(const fs::path &directory) {
+    auto path = luau::normalizePath(fs::absolute(directory).generic_string());
+    if (!path) {
+        throw std::runtime_error("can't use '" + directory.generic_string() +
+                                 "' as a module path");
     }
-    lua_setfield(L, LUA_GLOBALSINDEX, "args");
+    return *path;
 }
 
 void printSummary(const Project &project, const std::string &entry,
-                  const PackageManager *packages) {
+                  const PackageManager *packages,
+                  const LibrarySelection &libraries) {
     const Project::Manifest &manifest = project.manifest();
 
     std::string names;
@@ -227,6 +198,19 @@ void printSummary(const Project &project, const std::string &entry,
               << " (" << project.root().generic_string() << ")\n"
               << "entry     " << entry << '\n'
               << "packages  " << (names.empty() ? "none" : names) << '\n';
+
+    std::string libs = "all";
+    if (!libraries.all) {
+        libs.clear();
+        for (const std::string &name : libraries.libraries) {
+            libs += (libs.empty() ? "" : ", ") + name;
+        }
+    }
+    std::cerr << "libraries " << (libs.empty() ? "none" : libs) << '\n';
+
+    for (const std::string &warning : libraries.warnings) {
+        std::cerr << "warning: " << warning << '\n';
+    }
 }
 
 } // namespace
@@ -254,31 +238,47 @@ int run(int argc, char **argv) {
             prepareDependencies(*packages, project, options->install);
         }
 
+        // 3. Which built-in libraries the program may use. Throws BuildError
+        //    for an unknown name or a --!strict manifest without a list.
+        const std::vector<InstalledProject> dependencies =
+            openDependencies(project);
+        const LibrarySelection libraries =
+            selectLibraries(project, dependencies);
+
         if (options->verbose) {
-            printSummary(project, entry, packages ? &*packages : nullptr);
+            printSummary(project, entry, packages ? &*packages : nullptr,
+                         libraries);
         }
 
-        // 3. The module system. The loader must outlive the VM (it's
-        //    declared first, so it's destroyed last) and must not move.
+        // Every package's build.assets, for @sonata/pocket. Declared before
+        // the loader so it outlives the VM.
+        DiskPocket pocket;
+        pocket.addPackage(modulePath(project.root()), project.root(),
+                          project.manifest().build.assets);
+        for (const InstalledProject &dependency : dependencies) {
+            pocket.addPackage(modulePath(dependency.project.root()),
+                              dependency.project.root(),
+                              dependency.project.manifest().build.assets);
+        }
+
+        // 4. The module system. The loader must outlive the VM (runProgram
+        //    creates it) and must not move.
         luau::ModuleLoader loader(std::make_unique<luau::FileSystemSource>());
         if (packages) {
             packages->registerAliases(loader);
         }
-
-        // 4. The VM and its globals.
-        luau::VM vm;
-
-        luau::Environment environment;
-        environment.setNamespace("sonata", makeSonataNamespace(project, entry));
-        environment.load(vm);
-        setScriptArguments(vm.state(), options->scriptArgs);
-
-        // require() has to be defined before the globals are made read-only.
-        loader.install(vm);
-        luaL_sandbox(vm.state());
+        if (!libraries.all) {
+            loader.restrictLibraries(libraries.libraries, libraries.hint);
+        }
 
         // 5. Go. Throws ModuleError (with a stack trace) if the script fails.
-        loader.run(vm, entry);
+        runtime::ProgramInfo program;
+        program.name = project.manifest().name;
+        program.version = project.manifest().version;
+        program.root = project.root().generic_string();
+        program.entry = entry;
+
+        runtime::runProgram(loader, program, options->scriptArgs, &pocket);
         return 0;
     } catch (const luau::ModuleError &error) {
         std::cerr << error.what() << '\n';
@@ -297,7 +297,8 @@ const cli::Command &run_command() {
     static const cli::Argument verbose_arg{
         .name = "--verbose",
         .aliases = {"-v"},
-        .description = "Print the project, entry and packages being used"};
+        .description = "Print the project, entry, packages and libraries "
+                       "being used, and any warnings about them"};
 
     static const cli::Command command{
         .name = "run",
