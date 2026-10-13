@@ -15,10 +15,6 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
 
-    env:
-      SONATA_COMPRESS_ZSTD: "ON"
-      SONATA_COMPRESS_CRYPTO: "ON"
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v5
@@ -26,27 +22,17 @@ jobs:
         submodules: recursive
         fetch-depth: 0
 
-    - name: Install dependencies (Linux)
+    - name: Install OpenSSL (Linux)
       if: runner.os == 'Linux'
-      run: >
-        sudo apt-get update &&
-        sudo apt-get install -y
-        libssl-dev zlib1g-dev libzstd-dev libsodium-dev pkg-config
+      run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
-    - name: Install dependencies (macOS)
+    - name: Install OpenSSL (macOS)
       if: runner.os == 'macOS'
-      run: brew install openssl zstd libsodium pkgconf
+      run: brew install openssl
 
     - name: Install OpenSSL (Windows)
       if: runner.os == 'Windows'
       run: choco install openssl
-
-    - name: Install zlib, zstd, libsodium (Windows)
-      if: runner.os == 'Windows'
-      shell: bash
-      run: |
-        "$VCPKG_INSTALLATION_ROOT/vcpkg.exe" install zlib zstd libsodium --triplet x64-windows-static-md
-        echo "CMAKE_PREFIX_PATH=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md" >> "$GITHUB_ENV"
 
     - name: Build and package
       shell: bash
