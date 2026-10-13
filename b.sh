@@ -2,6 +2,31 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+# Help CMake's FindOpenSSL on platforms where OpenSSL isn't in a default
+# location (Homebrew keg on macOS, Program Files on Windows). This is what
+# lets the OpenSSL install steps in release.yml work without extra flags.
+# An OPENSSL_ROOT_DIR already set in the environment always wins.
+if [[ -z "${OPENSSL_ROOT_DIR:-}" ]]; then
+  case "$(uname -s)" in
+    Darwin)
+      if command -v brew >/dev/null 2>&1; then
+        ssl_prefix="$(brew --prefix openssl@3 2>/dev/null || true)"
+        if [[ -n "$ssl_prefix" && -d "$ssl_prefix/include/openssl" ]]; then
+          export OPENSSL_ROOT_DIR="$ssl_prefix"
+        fi
+      fi
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      for ssl_prefix in "/c/Program Files/OpenSSL" "/c/Program Files/OpenSSL-Win64"; do
+        if [[ -f "$ssl_prefix/include/openssl/ssl.h" ]]; then
+          export OPENSSL_ROOT_DIR="$(cygpath -m "$ssl_prefix")"
+          break
+        fi
+      done
+      ;;
+  esac
+fi
+
 cmd="${1:-debug}"
 
 case "$cmd" in
@@ -10,6 +35,10 @@ case "$cmd" in
     cmake --build --preset "$cmd" --parallel
     ln -sf "build/$cmd/compile_commands.json" compile_commands.json   # for clangd
     ;;
+  package)  cmake --preset package
+            cmake --build --preset package --parallel
+            cpack --config build/package/CPackConfig.cmake -C Release -B build/package
+            ;;
   run)      shift; ./build/debug/cli/sn "$@" ;;
   install)  cmake --install build/release --prefix "${PREFIX:-$HOME/.local}" ;;
   clean)    rm -rf build compile_commands.json ;;
@@ -44,5 +73,5 @@ case "$cmd" in
             ctest --test-dir "build/$preset" --output-on-failure \
                   --parallel "$(nproc 2>/dev/null || sysctl -n hw.ncpu)" "$@"
             ;;
-  *)        echo "usage: $0 [debug|release|run|install|clean|analyze|test]"; exit 1 ;;
+  *)        echo "usage: $0 [debug|release|package|run|install|clean|analyze|test]"; exit 1 ;;
 esac

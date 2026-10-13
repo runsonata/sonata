@@ -15,57 +15,50 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
 
+    env:
+      SONATA_COMPRESS_ZSTD: "ON"
+      SONATA_COMPRESS_CRYPTO: "ON"
+
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         submodules: recursive
         fetch-depth: 0
 
-    - name: Install OpenSSL (Linux)
+    - name: Install dependencies (Linux)
       if: runner.os == 'Linux'
-      run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      run: >
+        sudo apt-get update &&
+        sudo apt-get install -y
+        libssl-dev zlib1g-dev libzstd-dev libsodium-dev pkg-config
 
-    - name: Install OpenSSL (macOS)
+    - name: Install dependencies (macOS)
       if: runner.os == 'macOS'
-      run: brew install openssl
+      run: brew install openssl zstd libsodium pkgconf
 
     - name: Install OpenSSL (Windows)
       if: runner.os == 'Windows'
       run: choco install openssl
 
-    - name: Install zlib (Windows)
+    - name: Install zlib, zstd, libsodium (Windows)
       if: runner.os == 'Windows'
-      shell: pwsh
+      shell: bash
       run: |
-        vcpkg install zlib:x64-windows-static-md
-        $zlib = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
-        # zlib >= 1.3.2 names its static lib zs.lib, which CMake's FindZLIB doesn't search for
-        Copy-Item "$zlib\lib\zs.lib" "$zlib\lib\zlib.lib"
-        Copy-Item "$zlib\debug\lib\zsd.lib" "$zlib\debug\lib\zlibd.lib"
-        "CMAKE_PREFIX_PATH=$zlib" >> $env:GITHUB_ENV
+        "$VCPKG_INSTALLATION_ROOT/vcpkg.exe" install zlib zstd libsodium --triplet x64-windows-static-md
+        echo "CMAKE_PREFIX_PATH=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md" >> "$GITHUB_ENV"
 
-    - name: Configure CMake
-      run: >
-        cmake -B build -S . 
-        -DCMAKE_BUILD_TYPE=Release 
-        -DSONATA_INSTALL=ON 
-        -DSONATA_BUILD_CLI=ON
-
-    - name: Build
-      run: cmake --build build --preset release -j 4
-
-    - name: Run CPack
-      working-directory: build
-      run: cpack -C release
+    - name: Build and package
+      shell: bash
+      run: bash ./b.sh package
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: sonata-packages-${{ matrix.os }}
         path: |
-          build/*.tar.gz
-          build/*.zip
+          build/package/*.tar.gz
+          build/package/*.zip
         if-no-files-found: error
 
   create-release:

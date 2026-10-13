@@ -8,10 +8,22 @@
       "cacheVariables": { "CMAKE_EXPORT_COMPILE_COMMANDS": "ON" }
     },
     { "name": "debug",   "inherits": "base", "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },
-    { "name": "release", "inherits": "base", "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } }
+    { "name": "release", "inherits": "base", "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } },
+    {
+      "name": "package",
+      "inherits": "release",
+      "cacheVariables": {
+        "BUILD_SHARED_LIBS": "OFF",
+        "SONATA_INSTALL": "ON",
+        "SONATA_BUILD_CLI": "ON",
+        "SONATA_BUILD_TESTS": "OFF",
+        "CMAKE_POLICY_VERSION_MINIMUM": "3.5"
+      }
+    }
   ],
   "buildPresets": [
-    { "name": "debug",   "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" }
+    { "name": "debug",   "configurePreset": "debug",   "configuration": "Debug" },
+    { "name": "release", "configurePreset": "release", "configuration": "Release" },
+    { "name": "package", "configurePreset": "package", "configuration": "Release" }
   ]
 }
