@@ -95,10 +95,42 @@ if(SONATA_BUILD_TESTS)
 endif()
 
 if(SONATA_INSTALL)
+  # Packages are named sonata-<version>-<os>-<arch>, with the same os/arch
+  # names as info::platform_string(): linux|macos|windows and x64|arm64.
+  if(WIN32)
+    set(sonata_package_os windows)
+  elseif(APPLE)
+    set(sonata_package_os macos)
+  else()
+    string(TOLOWER "${CMAKE_SYSTEM_NAME}" sonata_package_os)
+  endif()
+
+  # The architecture being built for: MSVC knows it even when it isn't the
+  # host's (CMAKE_SYSTEM_PROCESSOR is the host's there), and on macOS
+  # CMAKE_OSX_ARCHITECTURES picks it.
+  if(MSVC AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID)
+    set(sonata_package_arch "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
+  elseif(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    set(sonata_package_arch "${CMAKE_OSX_ARCHITECTURES}")
+  else()
+    set(sonata_package_arch "${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
+  string(TOLOWER "${sonata_package_arch}" sonata_package_arch)
+  if(sonata_package_arch MATCHES ";")
+    set(sonata_package_arch universal)
+  elseif(sonata_package_arch MATCHES "^(x86_64|amd64|x64)$")
+    set(sonata_package_arch x64)
+  elseif(sonata_package_arch MATCHES "^(aarch64|arm64)$")
+    set(sonata_package_arch arm64)
+  endif()
+
   set(CPACK_PACKAGE_NAME "sonata")
   set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
-  set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
-  
+  if(SONATA_VERSION_PRE)
+    string(APPEND CPACK_PACKAGE_VERSION "-${SONATA_VERSION_PRE}")
+  endif()
+  set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${sonata_package_os}-${sonata_package_arch}")
+
   if(WIN32)
     set(CPACK_GENERATOR "ZIP")
   else()

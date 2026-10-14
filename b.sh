@@ -2,11 +2,33 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# Help CMake's FindOpenSSL on platforms where OpenSSL isn't in a default
-# location (Homebrew keg on macOS, Program Files on Windows). This is what
-# lets the OpenSSL install steps in release.yml work without extra flags.
+# Extra arguments for every configure.
+cmake_args=()
+
+# Windows: use vcpkg's libraries when theyre installed for
+# $VCPKG_DEFAULT_TRIPLET (default x64-windows-static-md static libraries
+# built for the dynamic CRT, so nothing needs DLLs next to it). VCPKG_ROOT is
+# vcpkg's own variable; GitHub's Windows runners set VCPKG_INSTALLATION_ROOT.
+# A CMAKE_TOOLCHAIN_FILE already set in the environment always wins.
+using_vcpkg=0
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    vcpkg_root="${VCPKG_ROOT:-${VCPKG_INSTALLATION_ROOT:-}}"
+    vcpkg_triplet="${VCPKG_DEFAULT_TRIPLET:-x64-windows-static-md}"
+    if [[ -z "${CMAKE_TOOLCHAIN_FILE:-}" && -n "$vcpkg_root" ]] &&
+       [[ -d "$(cygpath -u "$vcpkg_root")/installed/$vcpkg_triplet" ]]; then
+      vcpkg_root="$(cygpath -m "$vcpkg_root")"
+      cmake_args+=("-DCMAKE_TOOLCHAIN_FILE=$vcpkg_root/scripts/buildsystems/vcpkg.cmake"
+                   "-DVCPKG_TARGET_TRIPLET=$vcpkg_triplet")
+      using_vcpkg=1
+    fi
+    ;;
+esac
+
+# Help CMake's FindOpenSSL on platforms where OpenSSL isnt in a default
+# location (Homebrew keg on macOS, Program Files on Windows without vcpkg).
 # An OPENSSL_ROOT_DIR already set in the environment always wins.
-if [[ -z "${OPENSSL_ROOT_DIR:-}" ]]; then
+if [[ -z "${OPENSSL_ROOT_DIR:-}" && "$using_vcpkg" == 0 ]]; then
   case "$(uname -s)" in
     Darwin)
       if command -v brew >/dev/null 2>&1; then
@@ -29,13 +51,16 @@ fi
 
 cmd="${1:-debug}"
 
+# "${cmake_args[@]}" fails under set -u when empty in bash 3.2 (macOS).
+configure() { cmake --preset "$1" ${cmake_args[@]+"${cmake_args[@]}"}; }
+
 case "$cmd" in
   debug|release)
-    cmake --preset "$cmd"
+    configure "$cmd"
     cmake --build --preset "$cmd" --parallel
     ln -sf "build/$cmd/compile_commands.json" compile_commands.json   # for clangd
     ;;
-  package)  cmake --preset package
+  package)  configure package
             cmake --build --preset package --parallel
             cpack --config build/package/CPackConfig.cmake -C Release -B build/package
             ;;
@@ -68,9 +93,12 @@ case "$cmd" in
             if [[ "${1:-}" == "debug" || "${1:-}" == "release" ]]; then
               preset="$1"; shift
             fi
-            cmake --preset "$preset"
+            configure "$preset"
             cmake --build --preset "$preset" --parallel
-            ctest --test-dir "build/$preset" --output-on-failure \
+            # -C picks the build to test with multi-config generators (Visual
+            # Studio, the default on Windows); single-config ones ignore it.
+            config="Debug"; [[ "$preset" == "release" ]] && config="Release"
+            ctest --test-dir "build/$preset" -C "$config" --output-on-failure \
                   --parallel "$(nproc 2>/dev/null || sysctl -n hw.ncpu)" "$@"
             ;;
   *)        echo "usage: $0 [debug|release|package|run|install|clean|analyze|test]"; exit 1 ;;

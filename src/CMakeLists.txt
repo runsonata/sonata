@@ -166,6 +166,8 @@ if("net" IN_LIST SONATA_LIBS)
     message(STATUS "sonata: OpenSSL linked statically")
   endif()
 endif()
+# The CLI ships OpenSSL's DLLs on Windows only when they are needed.
+set(SONATA_OPENSSL_STATIC ${sonata_openssl_static} PARENT_SCOPE)
 
 set(SONATA_ZSTD_TARGET "")
 set(SONATA_SODIUM_TARGET "")

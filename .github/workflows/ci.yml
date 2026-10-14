@@ -15,36 +15,56 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    # Same libraries as a release: CMakeLists.txt reads these two variables as
+    # the default for its options, so the compress backends get tested too.
+    env:
+      SONATA_COMPRESS_ZSTD: "ON"
+      SONATA_COMPRESS_CRYPTO: "ON"
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v5
       with:
         submodules: recursive
 
-    - name: Install OpenSSL (Linux)
+    - name: Install dependencies (Linux)
       if: runner.os == 'Linux'
-      run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      run: >
+        sudo apt-get update &&
+        sudo apt-get install -y
+        libssl-dev zlib1g-dev libzstd-dev libsodium-dev pkg-config
+        clang-tidy jq
 
-    - name: Install OpenSSL (macOS)
+    # zlib is part of the macOS SDK.
+    - name: Install dependencies (macOS)
       if: runner.os == 'macOS'
-      run: brew install openssl
+      run: brew install openssl@3 zstd libsodium pkgconf
 
-    - name: Install OpenSSL (Windows)
+    # Static libraries built for the dynamic CRT (x64-windows-static-md, the
+    # triplet b.sh uses by default), so sn.exe and snrt.exe need no DLLs.
+    # b.sh finds them through VCPKG_INSTALLATION_ROOT.
+    - name: Cache vcpkg packages (Windows)
       if: runner.os == 'Windows'
-      run: choco install openssl
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/vcpkg-cache
+        key: vcpkg-x64-windows-static-md-${{ github.run_id }}
+        restore-keys: vcpkg-x64-windows-static-md-
 
-    - name: Install zlib (Windows)
+    - name: Install dependencies (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
+      env:
+        VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}/vcpkg-cache
       run: |
-        vcpkg install zlib:x64-windows-static-md
-        $zlib = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
-        Copy-Item "$zlib\lib\zs.lib" "$zlib\lib\zlib.lib"
-        Copy-Item "$zlib\debug\lib\zsd.lib" "$zlib\debug\lib\zlibd.lib"
-        "CMAKE_PREFIX_PATH=$zlib" >> $env:GITHUB_ENV
+        New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+        & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet x64-windows-static-md openssl zlib zstd libsodium
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     - name: Build and Run Tests
+      shell: bash
       run: bash ./b.sh test release
-      
+
     - name: Run Analyze (Linux Only)
       if: runner.os == 'Linux'
       run:  ln -sf "build/release/compile_commands.json" compile_commands.json && bash ./b.sh analyze

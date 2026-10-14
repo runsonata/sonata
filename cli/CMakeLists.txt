@@ -15,7 +15,8 @@ target_link_libraries(sn PRIVATE sonata_cli)
 
 install(TARGETS sn RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-if(WIN32)
+# A dynamically linked OpenSSL has to ship next to sn.exe.
+if(WIN32 AND "net" IN_LIST SONATA_LIBS AND NOT SONATA_OPENSSL_STATIC)
   get_filename_component(_sonata_ssl_root "${OPENSSL_INCLUDE_DIR}" DIRECTORY)
   file(GLOB _sonata_ssl_dlls
     "${_sonata_ssl_root}/bin/libssl-*.dll"
