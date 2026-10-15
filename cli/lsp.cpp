@@ -83,46 +83,62 @@ struct Json {
     bool boolean = false;
     std::string text; // String: the value. Number: the literal.
     std::vector<Json> items;
-    std::vector<std::pair<std::string, Json>> members;
+    // std::pair<std::string, Json> would need Json complete here, so the
+    // member type is declared now and defined after Json.
+    struct Member;
+    std::vector<Member> members;
 
-    static Json string(std::string_view value) {
-        Json json;
-        json.kind = Kind::String;
-        json.text = value;
-        return json;
-    }
+    static Json string(std::string_view value);
+    static Json boolean_value(bool value);
+    static Json object();
 
-    static Json boolean_value(bool value) {
-        Json json;
-        json.kind = Kind::Boolean;
-        json.boolean = value;
-        return json;
-    }
-
-    static Json object() {
-        Json json;
-        json.kind = Kind::Object;
-        return json;
-    }
-
-    Json *find(std::string_view key) {
-        for (auto &[name, value] : members) {
-            if (name == key)
-                return &value;
-        }
-        return nullptr;
-    }
+    Json *find(std::string_view key);
 
     // Replaces the value of "key" where it is, or appends it.
-    Json &set(std::string_view key, Json value) {
-        if (Json *existing = find(key)) {
-            *existing = std::move(value);
-            return *existing;
-        }
-        members.emplace_back(std::string(key), std::move(value));
-        return members.back().second;
-    }
+    Json &set(std::string_view key, Json value);
 };
+
+struct Json::Member {
+    std::string name;
+    Json value;
+};
+
+Json Json::string(std::string_view value) {
+    Json json;
+    json.kind = Kind::String;
+    json.text = value;
+    return json;
+}
+
+Json Json::boolean_value(bool value) {
+    Json json;
+    json.kind = Kind::Boolean;
+    json.boolean = value;
+    return json;
+}
+
+Json Json::object() {
+    Json json;
+    json.kind = Kind::Object;
+    return json;
+}
+
+Json *Json::find(std::string_view key) {
+    for (auto &[name, value] : members) {
+        if (name == key)
+            return &value;
+    }
+    return nullptr;
+}
+
+Json &Json::set(std::string_view key, Json value) {
+    if (Json *existing = find(key)) {
+        *existing = std::move(value);
+        return *existing;
+    }
+    members.push_back({std::string(key), std::move(value)});
+    return members.back().value;
+}
 
 class JsonParser {
 public:
@@ -439,9 +455,9 @@ void write_json(std::string &out, const Json &json, int depth) {
         out += '{';
         for (std::size_t i = 0; i < json.members.size(); ++i) {
             newline(depth + 1);
-            write_json_string(out, json.members[i].first);
+            write_json_string(out, json.members[i].name);
             out += ": ";
-            write_json(out, json.members[i].second, depth + 1);
+            write_json(out, json.members[i].value, depth + 1);
             if (i + 1 < json.members.size())
                 out += ',';
         }
@@ -632,8 +648,8 @@ void update_aliases(Json &config, const fs::path &root) {
     auto &members = aliases->members;
     members.erase(std::remove_if(members.begin(), members.end(),
                                  [&](const auto &member) {
-                                     return is_package_alias(member.second) &&
-                                            !installed(member.first);
+                                     return is_package_alias(member.value) &&
+                                            !installed(member.name);
                                  }),
                   members.end());
 

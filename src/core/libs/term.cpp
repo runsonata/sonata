@@ -1056,7 +1056,7 @@ bool parseHex(std::string_view hex, Rgb& rgb) {
         if (c >= 'A' && c <= 'F') return c - 'A' + 10;
         return -1;
     };
-    int values[6];
+    int values[6] = {};
     if (hex.size() != 3 && hex.size() != 6) {
         return false;
     }
