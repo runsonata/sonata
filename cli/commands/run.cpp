@@ -17,6 +17,7 @@
 #include <sonata/core/selection.hpp>
 
 #include "commands/run.hpp"
+#include "lsp.hpp"
 
 namespace fs = std::filesystem;
 
@@ -149,6 +150,7 @@ void prepareDependencies(PackageManager &packages, const Project &project,
         packages.setProgressCallback(
             [](const std::string &line) { std::cerr << line << '\n'; });
         packages.install();
+        lsp::refresh(project.root(), std::cerr);
         return;
     }
 

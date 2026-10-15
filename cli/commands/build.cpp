@@ -31,6 +31,7 @@
 #include <sonata/core/system.hpp>
 
 #include "commands/build.hpp"
+#include "lsp.hpp"
 
 namespace fs = std::filesystem;
 
@@ -298,6 +299,7 @@ void prepareDependencies(Project &project, bool install) {
     if (install) {
         packages.setProgressCallback([](const std::string &line) { std::cerr << line << '\n'; });
         packages.install();
+        lsp::refresh(project.root(), std::cerr);
         return;
     }
 

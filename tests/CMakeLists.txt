@@ -10,12 +10,20 @@ add_executable(sonata_tests
   test_builtins.cpp
   test_build.cpp
   test_runtime.cpp
+  test_lsp.cpp
 )
 
 target_link_libraries(sonata_tests PRIVATE
   sonata
   doctest::doctest
 )
+
+# test_lsp.cpp tests the CLI's Luau Language Server support.
+if(TARGET sonata_cli)
+  target_link_libraries(sonata_tests PRIVATE sonata_cli)
+else()
+  set_source_files_properties(test_lsp.cpp PROPERTIES HEADER_FILE_ONLY ON)
+endif()
 
 # Only needed if tests include private headers such as src/core/libs/libs.hpp
 target_include_directories(sonata_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)

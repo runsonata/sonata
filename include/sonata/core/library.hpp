@@ -25,6 +25,8 @@ namespace sonata::lib {
 //      (normally a table), in src/core/libs/<name>.cpp.
 //   3. Add <name> to SONATA_ALL_LIBS in src/CMakeLists.txt; the registry is
 //      generated from that list.
+//   4. Describe its API in types/libs/<name>.luau, the types "sn init --lsp"
+//      gives the Luau Language Server (tests/test_lsp.cpp checks it exists).
 //
 // See src/core/libs/path.cpp for a complete example.
 

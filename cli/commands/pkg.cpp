@@ -18,6 +18,7 @@
 #include <sonata/core/luau/datafile.hpp>
 #include "command.hpp"
 #include "commands/pkg.hpp"
+#include "lsp.hpp"
 
 /*
  * sn pkg add    [path] [deps] [-r file] [-nr] [-i]
@@ -865,6 +866,7 @@ int add(int argc, char **argv) {
             std::cout << " (" << skipped << " skipped)";
         std::cout << "\n";
     }
+    lsp::refresh(project.root(), std::cerr);
     return failures > 0 ? 1 : 0;
 }
 
@@ -1069,6 +1071,7 @@ int remove(int argc, char **argv) {
     else
         failures = remove_cascading(project, manager, names, everything);
 
+    lsp::refresh(project.root(), std::cerr);
     return failures > 0 ? 1 : 0;
 }
 
@@ -1148,6 +1151,7 @@ int update(int argc, char **argv) {
     if (failures > 0)
         std::cout << ", " << failures << " failed";
     std::cout << "\n";
+    lsp::refresh(context->project.root(), std::cerr);
     return failures > 0 ? 1 : 0;
 }
 
