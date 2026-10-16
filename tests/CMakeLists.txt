@@ -11,6 +11,7 @@ add_executable(sonata_tests
   test_build.cpp
   test_runtime.cpp
   test_lsp.cpp
+  test_lib_luau.cpp
 )
 
 target_link_libraries(sonata_tests PRIVATE

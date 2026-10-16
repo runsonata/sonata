@@ -15,18 +15,34 @@ configure_file(${PROJECT_SOURCE_DIR}/cmake/version.hpp.in
 # Libraries that aren't picked aren't compiled, and their native dependencies
 # (OpenSSL for net, zstd/libsodium for compress) aren't even looked for.
 set(SONATA_ALL_LIBS
-  fs path sys task process term net json crypto datetime compress regex serde sonata pocket)
+  fs path sys task process term net json crypto datetime compress regex serde sonata pocket luau)
 set(SONATA_LIBS "${SONATA_ALL_LIBS}" CACHE STRING
     "Built-in libraries to compile in (semicolon-separated)")
 
-# "stdio" became part of "term". Build folders configured before that still
-# have it in their cache.
+
 if("stdio" IN_LIST SONATA_LIBS)
   list(TRANSFORM SONATA_LIBS REPLACE "^stdio$" "term")
   list(REMOVE_DUPLICATES SONATA_LIBS)
   set(SONATA_LIBS "${SONATA_LIBS}" CACHE STRING "Built-in libraries to compile in (semicolon-separated)" FORCE)
   message(STATUS "sonata: SONATA_LIBS: 'stdio' is now part of 'term'")
 endif()
+
+# A build folder that uses the default list keeps every library when one is
+# added. SONATA_LIBS_DEFAULT remembers what the default was at the last
+# configure; folders configured before it existed had the list below. An
+# explicit list (like the one "sn build" passes) is left alone.
+if(DEFINED CACHE{SONATA_LIBS_DEFAULT})
+  set(sonata_previous_default "$CACHE{SONATA_LIBS_DEFAULT}")
+else()
+  set(sonata_previous_default
+    "fs;path;sys;task;process;term;net;json;crypto;datetime;compress;regex;serde;sonata;pocket")
+endif()
+if("${SONATA_LIBS}" STREQUAL "${sonata_previous_default}" AND
+   NOT "${SONATA_LIBS}" STREQUAL "${SONATA_ALL_LIBS}")
+  set(SONATA_LIBS "${SONATA_ALL_LIBS}" CACHE STRING "Built-in libraries to compile in (semicolon-separated)" FORCE)
+  message(STATUS "sonata: SONATA_LIBS: updated to every library")
+endif()
+set(SONATA_LIBS_DEFAULT "${SONATA_ALL_LIBS}" CACHE INTERNAL "")
 
 set(sonata_lib_sources "")
 set(SONATA_LIB_DECLARATIONS "")

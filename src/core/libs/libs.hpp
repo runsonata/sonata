@@ -22,5 +22,6 @@ void openRegex(lua_State* L);    // @sonata/regex
 void openSerde(lua_State* L);    // @sonata/serde
 void openSonata(lua_State* L);   // @sonata/sonata
 void openPocket(lua_State* L);   // @sonata/pocket
+void openLuau(lua_State* L);     // @sonata/luau
 
 } // namespace sonata::lib::libs
