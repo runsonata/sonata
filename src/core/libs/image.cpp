@@ -1034,6 +1034,38 @@ Wand faded(const Context& c, MagickWand* frame, double amount) {
     return out;
 }
 
+// Builds without a font list (Homebrew's, for one) can't draw text with no
+// font set ("unable to read font `'"), so those get a font file the system is
+// known to have. Empty when ImageMagick has fonts of its own.
+const std::string& fallbackFont() {
+    static const std::string font = [] {
+        size_t count = 0;
+        char** fonts = MagickQueryFonts("*", &count);
+        if (fonts) {
+            for (size_t i = 0; i < count; ++i) {
+                MagickRelinquishMemory(fonts[i]);
+            }
+            MagickRelinquishMemory(fonts);
+        }
+        if (count > 0) {
+            return std::string();
+        }
+        static constexpr const char* kCandidates[] = {
+            "/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",          "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",          "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        };
+        for (const char* path : kCandidates) {
+            std::error_code error;
+            if (std::filesystem::is_regular_file(path, error)) {
+                return std::string(path);
+            }
+        }
+        return std::string();
+    }();
+    return font;
+}
+
 // Drawing styles ////////////////////////////////////////////////////////////
 
 enum class Shape { Filled, Line, Text };
@@ -1061,6 +1093,8 @@ Style readStyle(const Context& c, int index, Shape shape) {
             if (DrawSetFont(d, font->c_str()) == MagickFalse) {
                 c.fail("could not use the font '" + *font + "'");
             }
+        } else if (!fallbackFont().empty()) {
+            DrawSetFont(d, fallbackFont().c_str());
         }
         if (std::optional<std::string> family = o.field("family").optString()) {
             DrawSetFontFamily(d, family->c_str());
@@ -1296,6 +1330,9 @@ int imageGenerate(lua_State* L) {
             const size_t columns = width ? c.arg(2, "width").size() : 0;
             const size_t rows = height ? c.arg(3, "height").size() : 0;
             MagickSetSize(w.get(), columns, rows);
+        }
+        if ((coder == "label" || coder == "caption") && !fallbackFont().empty()) {
+            MagickSetFont(w.get(), fallbackFont().c_str());
         }
         const std::string full = coder + ":" + ((coder == "label" || coder == "caption") ? literalLabel(rest) : rest);
         c.check(MagickReadImage(w.get(), full.c_str()), w.get());
@@ -2615,9 +2652,12 @@ int imgAlpha(lua_State* L) {
         const Context c{L, "Image:alpha"};
         Image& img = c.image(1);
         std::string mode = lowercase(c.arg(2, "mode").string());
-        // ImageMagick 6 calls them activate / deactivate.
+#if !SONATA_IM7
+        // ImageMagick 6 calls them activate / deactivate. 7 has both, but its
+        // deactivate keeps the channel (just ignored), where off removes it.
         if (mode == "on") mode = "activate";
         if (mode == "off") mode = "deactivate";
+#endif
         const im::AlphaOption option = parseEnum<im::AlphaOption>(c, im::kAlphaOptions, mode, "alpha mode", "alpha");
         eachFrame(c, img.wand, [&] { return MagickSetImageAlphaChannel(img.wand, option); });
         return self(L);

@@ -223,7 +223,9 @@ TEST_SUITE("image library") {
         assert(base:clone():convolve({ 0, 0, 0, 0, 1, 0, 0, 0, 0 }):signature() == base:signature())
         assert(base:clone():convolve("3x3: 0,0,0 0,1,0 0,0,0"):signature() == base:signature())
         assert(base:clone():distort("srt", { 0.5, 0 }).width == base.width)
-        assert(base:clone():liquidRescale(50, 40).width == 50)
+        -- Seam carving needs liblqr, which some builds (Homebrew's) leave out.
+        local ok, resized = pcall(base.liquidRescale, base:clone(), 50, 40)
+        assert(if ok then resized.width == 50 else string.find(resized, "(LQR)", 1, true), resized)
 
         local anim = image.animate({ image.new(8, 8, "red"), image.new(8, 8, "blue") })
         anim:blur(1):resize(4):drawRect(0, 0, 2, 2, { fill = "black" })
