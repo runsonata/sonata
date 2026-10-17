@@ -33,16 +33,17 @@ jobs:
         sudo apt-get update &&
         sudo apt-get install -y
         libssl-dev zlib1g-dev libzstd-dev libsodium-dev pkg-config
-        clang-tidy jq
+        libmagickwand-dev clang-tidy jq
 
     # zlib is part of the macOS SDK.
     - name: Install dependencies (macOS)
       if: runner.os == 'macOS'
-      run: brew install openssl@3 zstd libsodium pkgconf
+      run: brew install openssl@3 zstd libsodium pkgconf imagemagick
 
     # Static libraries built for the dynamic CRT (x64-windows-static-md, the
     # triplet b.sh uses by default), so sn.exe and snrt.exe need no DLLs.
-    # b.sh finds them through VCPKG_INSTALLATION_ROOT.
+    # b.sh finds them through VCPKG_INSTALLATION_ROOT. vcpkg has no
+    # ImageMagick, so Windows builds leave the image library out.
     - name: Cache vcpkg packages (Windows)
       if: runner.os == 'Windows'
       uses: actions/cache@v4

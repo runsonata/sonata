@@ -13,19 +13,12 @@ configure_file(${PROJECT_SOURCE_DIR}/cmake/version.hpp.in
 # SONATA_LIBS picks which of them are compiled in. A normal build has all of
 # them; "sn build" sets it when it builds a runtime tailored to one program.
 # Libraries that aren't picked aren't compiled, and their native dependencies
-# (OpenSSL for net, zstd/libsodium for compress) aren't even looked for.
+# (OpenSSL for net, zstd/libsodium for compress, ImageMagick for image) aren't
+# even looked for.
 set(SONATA_ALL_LIBS
-  fs path sys task process term net json crypto datetime compress regex serde sonata pocket luau)
+  fs path sys task process term net json crypto datetime compress regex serde sonata pocket luau image)
 set(SONATA_LIBS "${SONATA_ALL_LIBS}" CACHE STRING
     "Built-in libraries to compile in (semicolon-separated)")
-
-
-if("stdio" IN_LIST SONATA_LIBS)
-  list(TRANSFORM SONATA_LIBS REPLACE "^stdio$" "term")
-  list(REMOVE_DUPLICATES SONATA_LIBS)
-  set(SONATA_LIBS "${SONATA_LIBS}" CACHE STRING "Built-in libraries to compile in (semicolon-separated)" FORCE)
-  message(STATUS "sonata: SONATA_LIBS: 'stdio' is now part of 'term'")
-endif()
 
 # A build folder that uses the default list keeps every library when one is
 # added. SONATA_LIBS_DEFAULT remembers what the default was at the last
@@ -43,6 +36,103 @@ if("${SONATA_LIBS}" STREQUAL "${sonata_previous_default}" AND
   message(STATUS "sonata: SONATA_LIBS: updated to every library")
 endif()
 set(SONATA_LIBS_DEFAULT "${SONATA_ALL_LIBS}" CACHE INTERNAL "")
+
+# ---- ImageMagick (for image) ----
+# MagickWand, the C API of ImageMagick 6 or 7, found through pkg-config
+# (Linux, macOS, MSYS2) or CMake's FindImageMagick (the Windows installer with
+# its development headers). It is linked dynamically even with
+# SONATA_STATIC_DEPS: a static ImageMagick also needs static copies of every
+# delegate it was built with (libpng, libjpeg, freetype, lcms2, X11, ...).
+#
+# ImageMagick is a big dependency, so a build with the default library list
+# leaves image out (with a warning) when ImageMagick isn't installed. A list
+# that names image explicitly, like the one "sn build" passes, requires it.
+set(sonata_imagemagick_libraries "")
+set(sonata_imagemagick_includes "")
+set(sonata_imagemagick_options "")
+if("image" IN_LIST SONATA_LIBS)
+  set(sonata_imagemagick_static OFF)
+  if(SONATA_STANDALONE)
+    set(sonata_imagemagick_static ON)
+  endif()
+
+  find_package(PkgConfig QUIET)
+  if(PKG_CONFIG_FOUND)
+    set(PKG_CONFIG_USE_STATIC_LIBS ${sonata_imagemagick_static})
+    pkg_check_modules(SONATA_MAGICKWAND QUIET MagickWand)
+    set(PKG_CONFIG_USE_STATIC_LIBS OFF)
+  endif()
+
+  if(SONATA_MAGICKWAND_FOUND)
+    if(sonata_imagemagick_static)
+      set(sonata_imagemagick_libraries ${SONATA_MAGICKWAND_STATIC_LINK_LIBRARIES})
+      set(sonata_imagemagick_includes ${SONATA_MAGICKWAND_STATIC_INCLUDE_DIRS})
+      set(sonata_imagemagick_options ${SONATA_MAGICKWAND_STATIC_CFLAGS_OTHER})
+      if(NOT sonata_imagemagick_libraries) # CMake < 3.25 has no _STATIC_LINK_LIBRARIES
+        set(sonata_imagemagick_libraries ${SONATA_MAGICKWAND_STATIC_LDFLAGS})
+      endif()
+    else()
+      set(sonata_imagemagick_libraries ${SONATA_MAGICKWAND_LINK_LIBRARIES})
+      set(sonata_imagemagick_includes ${SONATA_MAGICKWAND_INCLUDE_DIRS})
+      set(sonata_imagemagick_options ${SONATA_MAGICKWAND_CFLAGS_OTHER})
+    endif()
+    set(sonata_imagemagick_version "${SONATA_MAGICKWAND_VERSION}")
+  else()
+    find_package(ImageMagick QUIET COMPONENTS MagickWand MagickCore)
+    if(ImageMagick_MagickWand_FOUND AND ImageMagick_MagickCore_FOUND)
+      set(sonata_imagemagick_libraries ${ImageMagick_MagickWand_LIBRARY} ${ImageMagick_MagickCore_LIBRARY})
+      set(sonata_imagemagick_includes ${ImageMagick_MagickWand_INCLUDE_DIRS} ${ImageMagick_MagickCore_INCLUDE_DIRS})
+      set(sonata_imagemagick_version "${ImageMagick_VERSION_STRING}")
+    endif()
+  endif()
+
+  if(sonata_imagemagick_libraries AND sonata_imagemagick_static)
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES ${sonata_imagemagick_includes})
+    set(CMAKE_REQUIRED_FLAGS ${sonata_imagemagick_options})
+    list(JOIN CMAKE_REQUIRED_FLAGS " " CMAKE_REQUIRED_FLAGS)
+    set(CMAKE_REQUIRED_LIBRARIES ${sonata_imagemagick_libraries})
+    set(CMAKE_REQUIRED_LINK_OPTIONS -static)
+    check_cxx_source_compiles("
+      #if __has_include(<MagickWand/MagickWand.h>)
+      #include <MagickWand/MagickWand.h>
+      #else
+      #include <wand/MagickWand.h>
+      #endif
+      int main() { MagickWandGenesis(); return 0; }" SONATA_IMAGEMAGICK_LINKS_STATICALLY)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_FLAGS)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    unset(CMAKE_REQUIRED_LINK_OPTIONS)
+    if(NOT SONATA_IMAGEMAGICK_LINKS_STATICALLY)
+      message(FATAL_ERROR
+        "SONATA_STANDALONE: ImageMagick (for the image library) can't be linked statically; "
+        "that needs static copies of ImageMagick and of every library it was built with. "
+        "Build without SONATA_STANDALONE, or leave image out of SONATA_LIBS.")
+    endif()
+  endif()
+
+  if(sonata_imagemagick_libraries)
+    message(STATUS "sonata: image: ImageMagick ${sonata_imagemagick_version}")
+  elseif("${SONATA_LIBS}" STREQUAL "${SONATA_ALL_LIBS}")
+    message(WARNING
+      "ImageMagick (MagickWand) was not found, so the image library is left out. "
+      "Install it (libmagickwand-dev / brew install imagemagick / the Windows "
+      "installer with its development headers) and configure again.")
+    list(REMOVE_ITEM SONATA_LIBS image)
+  else()
+    message(FATAL_ERROR
+      "SONATA_LIBS includes image, but ImageMagick (MagickWand) was not found. "
+      "Install it (libmagickwand-dev / brew install imagemagick / the Windows "
+      "installer with its development headers), or point PKG_CONFIG_PATH or "
+      "CMAKE_PREFIX_PATH at it.")
+  endif()
+endif()
+# Lets tests/ know whether image is compiled in.
+set(SONATA_HAS_IMAGE OFF PARENT_SCOPE)
+if("image" IN_LIST SONATA_LIBS)
+  set(SONATA_HAS_IMAGE ON PARENT_SCOPE)
+endif()
 
 set(sonata_lib_sources "")
 set(SONATA_LIB_DECLARATIONS "")
@@ -73,6 +163,14 @@ endforeach()
 
 configure_file(${PROJECT_SOURCE_DIR}/cmake/builtin_registry.cpp.in
                ${CMAKE_CURRENT_BINARY_DIR}/generated/builtin_registry.cpp @ONLY)
+
+# ImageMagick's headers and flags (-fopenmp, its quantum depth) only matter to
+# the file that includes them.
+if("image" IN_LIST SONATA_LIBS)
+  set_source_files_properties(core/libs/image.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${sonata_imagemagick_includes}"
+    COMPILE_OPTIONS "${sonata_imagemagick_options}")
+endif()
 
 set(sonata_sources
   # systems
@@ -329,6 +427,10 @@ function(sonata_setup_library target)
   if(SONATA_SODIUM_TARGET)
     target_link_libraries(${target} PRIVATE ${SONATA_SODIUM_TARGET})
     target_compile_definitions(${target} PUBLIC SONATA_COMPRESS_CRYPTO)
+  endif()
+
+  if("image" IN_LIST SONATA_LIBS)
+    target_link_libraries(${target} PRIVATE ${sonata_imagemagick_libraries})
   endif()
 
   if(WIN32)

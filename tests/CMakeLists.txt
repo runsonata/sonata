@@ -14,6 +14,11 @@ add_executable(sonata_tests
   test_lib_luau.cpp
 )
 
+# image is left out of builds without ImageMagick (see src/CMakeLists.txt).
+if(SONATA_HAS_IMAGE)
+  target_sources(sonata_tests PRIVATE test_lib_image.cpp)
+endif()
+
 target_link_libraries(sonata_tests PRIVATE
   sonata
   doctest::doctest

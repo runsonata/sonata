@@ -186,9 +186,10 @@ TEST_SUITE("builtins") {
         assert(event and event.kind == "create" and event.path == root .. "/new.txt" and not event.isDir)
         fs.writeFile(root .. "/a.txt", "changed, and longer")
         fs.removeFile(root .. "/b.luau")
-        local kinds = {}
-        for _, e in watcher:poll() do kinds[e.kind] = e.path end
-        assert(kinds.modify == root .. "/a.txt" and kinds.remove == root .. "/b.luau")
+        -- By path: a scan that caught new.txt mid-write also reports it modified now.
+        local changes = {}
+        for _, e in watcher:poll() do changes[e.path] = e.kind end
+        assert(changes[root .. "/a.txt"] == "modify" and changes[root .. "/b.luau"] == "remove")
         assert(watcher:next(0.05) == nil)
         watcher:close()
         assert(watcher:next() == nil)
